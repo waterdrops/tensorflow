@@ -190,7 +190,7 @@ NcclAllReduceConfig GetNcclAllReduceConfig(OpT op) {
 }
 
 template <typename OpT>
-bool IsDegenerate(OpT op, int64 replica_count, int64 partition_count) {
+bool IsDegenerate(OpT op, int64_t replica_count, int64_t partition_count) {
   return GetNcclCollectiveConfigForMlir(op, op.use_global_device_ids())
       .IsDegenerate(replica_count, partition_count);
 }
@@ -223,8 +223,8 @@ bool NcclAllReduceThunk::CanImplement(mlir::lmhlo::AllReduceOp op) {
 }
 
 bool NcclAllReduceThunk::IsDegenerate(mlir::lmhlo::AllReduceOp op,
-                                      int64 replica_count,
-                                      int64 partition_count) {
+                                      int64_t replica_count,
+                                      int64_t partition_count) {
   return impl::IsDegenerate(op, replica_count, partition_count);
 }
 
@@ -256,8 +256,8 @@ bool NcclAllReduceStartThunk::CanImplement(
 }
 
 bool NcclAllReduceStartThunk::IsDegenerate(mlir::lmhlo_gpu::AllReduceStartOp op,
-                                           int64 replica_count,
-                                           int64 partition_count) {
+                                           int64_t replica_count,
+                                           int64_t partition_count) {
   return impl::IsDegenerate(op, replica_count, partition_count);
 }
 
@@ -314,34 +314,34 @@ Status NcclAllReduceDoneThunk::ExecuteOnStream(const ExecuteParams& params) {
   return Status::OK();
 }
 
-NcclAllReduceScatterThunk::NcclAllReduceScatterThunk(
-    ThunkInfo thunk_info, mlir::lmhlo::AllReduceScatterOp op,
+NcclReduceScatterThunk::NcclReduceScatterThunk(
+    ThunkInfo thunk_info, mlir::lmhlo::ReduceScatterOp op,
     std::vector<NcclAllReduceThunk::Buffer> buffers)
-    : NcclAllReduceThunkBase(Thunk::kNcclAllReduceScatter, thunk_info,
+    : NcclAllReduceThunkBase(Thunk::kNcclReduceScatter, thunk_info,
                              impl::GetNcclAllReduceConfig(op),
                              std::move(buffers)) {}
 
-/*static*/ bool NcclAllReduceScatterThunk::CanImplement(
-    mlir::lmhlo::AllReduceScatterOp op) {
+/*static*/ bool NcclReduceScatterThunk::CanImplement(
+    mlir::lmhlo::ReduceScatterOp op) {
   return impl::CanImplement(op);
 }
 
-/*static*/ bool NcclAllReduceScatterThunk::IsDegenerate(
-    mlir::lmhlo::AllReduceScatterOp op, int64 replica_count,
-    int64 partition_count) {
+/*static*/ bool NcclReduceScatterThunk::IsDegenerate(
+    mlir::lmhlo::ReduceScatterOp op, int64_t replica_count,
+    int64_t partition_count) {
   return impl::IsDegenerate(op, replica_count, partition_count);
 }
 
-/*static*/ CollectiveOpGroupMode NcclAllReduceScatterThunk::GetGroupMode(
-    mlir::lmhlo::AllReduceScatterOp op) {
+/*static*/ CollectiveOpGroupMode NcclReduceScatterThunk::GetGroupMode(
+    mlir::lmhlo::ReduceScatterOp op) {
   return impl::GetGroupMode(op);
 }
 
-Status NcclAllReduceScatterThunk::RunNcclCollective(const ExecuteParams& params,
-                                                    ncclComm_t comm) {
+Status NcclReduceScatterThunk::RunNcclCollective(const ExecuteParams& params,
+                                                 ncclComm_t comm) {
 #if XLA_ENABLE_XCCL
   int device_ordinal = params.stream->parent()->device_ordinal();
-  VLOG(3) << "Performing all-reduce-scatter from device ordinal: "
+  VLOG(3) << "Performing reduce-scatter from device ordinal: "
           << device_ordinal;
 
   ncclRedOp_t reduce_op = ToNcclReduction(config_.reduction_kind);
@@ -371,7 +371,7 @@ Status NcclAllReduceScatterThunk::RunNcclCollective(const ExecuteParams& params,
         << "Source buffer was not an exact multiple of the number of "
            "participants.";
 
-    int64 recv_count = buffer.element_count / num_participants;
+    int64_t recv_count = buffer.element_count / num_participants;
     VLOG(3) << absl::StreamFormat(
         "Calling ncclReduceScatter(send_buffer=%p, recv_buffer=%p, "
         "recvcount=%d, "
@@ -384,8 +384,7 @@ Status NcclAllReduceScatterThunk::RunNcclCollective(const ExecuteParams& params,
   }
   XLA_CUDA_RETURN_IF_ERROR(ncclGroupEnd());
 
-  VLOG(3) << "Done performing all-reduce-scatter for ordinal: "
-          << device_ordinal;
+  VLOG(3) << "Done performing reduce-scatter for ordinal: " << device_ordinal;
   return Status::OK();
 #else   // XLA_ENABLE_XCCL
   return Unimplemented(

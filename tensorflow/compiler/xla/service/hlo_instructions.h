@@ -389,10 +389,10 @@ class HloCollectiveInstruction : public HloChannelInstruction {
 class HloAllGatherInstruction : public HloCollectiveInstruction {
  public:
   explicit HloAllGatherInstruction(
-      const Shape& shape, absl::Span<HloInstruction* const> operands,
-      int64 all_gather_dimension, absl::Span<const ReplicaGroup> replica_groups,
-      bool constrain_layout, const absl::optional<int64>& channel_id,
-      bool use_global_device_ids);
+      HloOpcode opcode, const Shape& shape,
+      absl::Span<HloInstruction* const> operands, int64 all_gather_dimension,
+      absl::Span<const ReplicaGroup> replica_groups, bool constrain_layout,
+      const absl::optional<int64>& channel_id, bool use_global_device_ids);
   // Same as HloAllReduceInstruction::use_global_device_ids.
   bool use_global_device_ids() const { return use_global_device_ids_; }
 
@@ -472,9 +472,9 @@ class HloAllReduceInstruction : public HloAllReduceInstructionBase {
       HloCloneContext* context) const override;
 };
 
-class HloAllReduceScatterInstruction : public HloAllReduceInstructionBase {
+class HloReduceScatterInstruction : public HloAllReduceInstructionBase {
  public:
-  explicit HloAllReduceScatterInstruction(
+  explicit HloReduceScatterInstruction(
       const Shape& shape, absl::Span<HloInstruction* const> operands,
       HloComputation* reduce_computation,
       absl::Span<const ReplicaGroup> replica_groups, bool constrain_layout,
