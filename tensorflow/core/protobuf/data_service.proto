@@ -1,3 +1,18 @@
+// Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ==============================================================================
+
 syntax = "proto3";
 
 package tensorflow.data;
@@ -61,7 +76,7 @@ enum DeploymentMode {
 }
 
 // Metadata related to tf.data service datasets.
-// Next tag: 3
+// Next tag: 4
 message DataServiceMetadata {
   oneof optional_element_spec {
     // Serialized element spec.
@@ -71,9 +86,25 @@ message DataServiceMetadata {
   enum Compression {
     COMPRESSION_UNSPECIFIED = 0;
     // No compression.
-    OFF = 1;
-    // Snappy compression as defined in tensorflow/core/platform/snappy.h.
-    SNAPPY = 2;
+    COMPRESSION_OFF = 1;
+    // AUTO compression, either none or snappy compression as defined in
+    // tensorflow/core/platform/snappy.h.
+    COMPRESSION_SNAPPY = 2;
+    // Forced a snappy compression as in tensorflow/core/platform/snappy.h.
+    COMPRESSION_FORCED_SNAPPY = 3;
   }
   Compression compression = 2;
+
+  // Cardinality of the dataset.
+  int64 cardinality = 3;
+}
+
+message CrossTrainerCacheOptions {
+  string trainer_id = 1;
+}
+
+// Data service config available to the client through GetDataServiceConfig RPC.
+// Next tag: 2
+message DataServiceConfig {
+  DeploymentMode deployment_mode = 1;
 }

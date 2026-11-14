@@ -17,7 +17,11 @@
 import numpy as np
 
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors_impl
+from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import math_ops
 from tensorflow.python.platform import test
 
 
@@ -39,14 +43,23 @@ class ExtractImagePatches(test.TestCase):
     strides = [1] + strides + [1]
     rates = [1] + rates + [1]
 
-    out_tensor = array_ops.extract_image_patches(
-        constant_op.constant(image),
-        ksizes=ksizes,
-        strides=strides,
-        rates=rates,
-        padding=padding,
-        name="im2col")
-    self.assertAllClose(patches, self.evaluate(out_tensor))
+    for dtype in [
+        np.float16,
+        np.float32,
+        np.float64,
+        dtypes.bfloat16.as_numpy_dtype,
+    ]:
+      out_tensor = array_ops.extract_image_patches(
+          constant_op.constant(image, dtype=dtype),
+          ksizes=ksizes,
+          strides=strides,
+          rates=rates,
+          padding=padding,
+          name="im2col",
+      )
+      self.assertAllClose(
+          np.array(patches, dtype=dtype), self.evaluate(out_tensor)
+      )
 
   def testKsize1x1Stride1x1Rate1x1(self):
     """Verifies that for 1x1 kernel the output equals the input."""
@@ -122,7 +135,7 @@ class ExtractImagePatches(test.TestCase):
         patches=patches)
 
   def testComplexDataTypes(self):
-    """Test for complex data types"""
+    """Test for complex data types."""
     for dtype in [np.complex64, np.complex128]:
       image = (
           np.reshape(range(120), [2, 3, 4, 5]).astype(dtype) +
@@ -138,6 +151,98 @@ class ExtractImagePatches(test.TestCase):
             rates=[1, 1],
             padding=padding,
             patches=patches)
+
+  def testInvalidAttributes(self):
+    """Test for passing weird things into ksizes."""
+    with self.assertRaisesRegex(TypeError, "Expected list"):
+      image = constant_op.constant([0.0])
+      ksizes = math_ops.cast(
+          constant_op.constant(dtype=dtypes.int16, value=[[1, 4], [5, 2]]),
+          dtype=dtypes.qint16)
+      strides = [1, 1, 1, 1]
+      self.evaluate(
+          array_ops.extract_image_patches(
+              image, ksizes=ksizes, strides=strides, padding="SAME"))
+
+  def testLargeKsize(self):
+    """Test for integer overflow with large ksizes."""
+    for dtype in [
+        np.float16,
+        np.float32,
+        np.float64,
+        dtypes.bfloat16.as_numpy_dtype,
+        np.complex64,
+        np.complex128,
+    ]:
+      image = np.ones([1, 1, 1, 3], dtype=dtype)
+      with self.assertRaisesRegex(
+          (errors_impl.InvalidArgumentError, ValueError),
+          r"Output size would overflow|Negative dimension size caused by"
+          r" overflow",
+      ):
+        out_tensor = array_ops.extract_image_patches(
+            constant_op.constant(image),
+            ksizes=[1, 2147483647, 2147483647, 1],
+            strides=[1, 1, 1, 1],
+            rates=[1, 1, 1, 1],
+            padding="SAME",
+        )
+        self.evaluate(out_tensor)
+
+  def testLargeKsizeDynamic(self):
+    """Tests OpKernel integer overflow using dynamic shapes."""
+    with ops.Graph().as_default():
+      image_ph = array_ops.placeholder(dtypes.float32, shape=[1, 1, 1, None])
+      out_tensor = array_ops.extract_image_patches(
+          image_ph,
+          ksizes=[1, 2147483647, 2147483647, 1],
+          strides=[1, 1, 1, 1],
+          rates=[1, 1, 1, 1],
+          padding="SAME",
+      )
+
+      with self.session() as sess:
+        with self.assertRaisesRegex(
+            errors_impl.InvalidArgumentError, r"Output size would overflow"
+        ):
+          sess.run(
+              out_tensor,
+              feed_dict={image_ph: np.ones([1, 1, 1, 3], dtype=np.float32)},
+          )
+
+  def testNegativeOrZeroAttributes(self):
+    """Test for negative or zero spatial attributes."""
+    image = constant_op.constant(np.ones([1, 2, 2, 1], dtype=np.float32))
+    valid = [1, 1, 1, 1]
+    for attr, value in [
+        ("ksizes", [1, -1, 2, 1]),
+        ("ksizes", [1, 2, 0, 1]),
+        ("ksizes", [1, -1, -2, 1]),
+        ("strides", [1, -1, 1, 1]),
+        ("strides", [1, 1, 0, 1]),
+        ("rates", [1, -1, 1, 1]),
+        ("rates", [1, 1, 0, 1]),
+    ]:
+      kwargs = {"ksizes": valid, "strides": valid, "rates": valid}
+      kwargs[attr] = value
+      # Graph construction runs the shape function (ValueError); eager
+      # execution runs the kernel constructor (OutOfRangeError).
+      with self.assertRaisesRegex(
+          (errors_impl.OutOfRangeError, ValueError),
+          rf"ExtractImagePatches requires spatial {attr} to be positive"
+          rf"|{attr} is out of range",
+      ):
+        self.evaluate(
+            array_ops.extract_image_patches(image, padding="VALID", **kwargs)
+        )
+      # Shape inference must reject the same attributes.
+      with ops.Graph().as_default():
+        image_ph = array_ops.placeholder(dtypes.float32, shape=[1, 2, 2, 1])
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"ExtractImagePatches requires spatial {attr} to be positive",
+        ):
+          array_ops.extract_image_patches(image_ph, padding="VALID", **kwargs)
 
 
 if __name__ == "__main__":

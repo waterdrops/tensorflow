@@ -17,8 +17,6 @@
 import os
 import unittest
 
-import six
-
 from tensorflow.core.framework import graph_pb2
 from tensorflow.core.framework import node_def_pb2
 from tensorflow.core.framework import step_stats_pb2
@@ -36,6 +34,7 @@ from tensorflow.python.framework import tensor_util
 from tensorflow.python.framework import test_util
 from tensorflow.python.lib.io import tf_record
 from tensorflow.python.module import module
+from tensorflow.python.ops import gen_summary_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import summary_ops_v2 as summary_ops
 from tensorflow.python.ops import variables
@@ -583,6 +582,26 @@ class SummaryOpsCoreTest(test_util.TensorFlowTestCase):
         # Reset to default state for other tests.
         summary_ops.set_step(None)
 
+  def testSetStep_rejectsNonCastableValue(self):
+    with context.eager_mode():
+      with self.assertRaises(errors.OpError):
+        summary_ops.set_step('not-a-step')
+
+  def testSetStep_rejectsNonScalarValue(self):
+    with self.assertRaisesRegex(ValueError, 'step.*must be a scalar'):
+      summary_ops.set_step([1, 2])
+
+  def testAsDefault_rejectsNonCastableStep(self):
+    with context.eager_mode():
+      writer = summary_ops.create_file_writer_v2(self.get_temp_dir())
+      with self.assertRaises(errors.OpError):
+        writer.as_default(step='not-a-step')
+
+  def testAsDefault_rejectsNonScalarStep(self):
+    writer = summary_ops.create_file_writer_v2(self.get_temp_dir())
+    with self.assertRaisesRegex(ValueError, 'step.*must be a scalar'):
+      writer.as_default(step=[1, 2])
+
   def testGetSetStep_variable_fromFunction(self):
     with context.eager_mode():
       try:
@@ -745,6 +764,15 @@ class SummaryOpsCoreTest(test_util.TensorFlowTestCase):
         return results
       self.assertAllEqual([False, True, False, True], f(True))
       self.assertAllEqual([False, True, False, False], f(False))
+
+  def testHasDefaultWriter_checkWriter(self):
+    logdir = self.get_temp_dir()
+    with context.eager_mode():
+      with self.subTest(name='has_writer'):
+        with summary_ops.create_file_writer_v2(logdir).as_default():
+          self.assertTrue(summary_ops.has_default_writer())
+      with self.subTest(name='no_writer'):
+        self.assertFalse(summary_ops.has_default_writer())
 
 
 class SummaryWriterTest(test_util.TensorFlowTestCase):
@@ -976,10 +1004,12 @@ class SummaryWriterTest(test_util.TensorFlowTestCase):
         self.assertEqual(3, get_total())
         summary_ops.flush(writer=writer)
         self.assertEqual(4, get_total())
-        summary_ops.write('tag', 1, step=0)
-        self.assertEqual(4, get_total())
-        summary_ops.flush(writer=writer._resource)  # pylint:disable=protected-access
-        self.assertEqual(5, get_total())
+
+  # Regression test for b/228097117.
+  def testFlushFunction_disallowsInvalidWriterInput(self):
+    with context.eager_mode():
+      with self.assertRaisesRegex(ValueError, 'Invalid argument to flush'):
+        summary_ops.flush(writer=())
 
   @test_util.assert_no_new_tensors
   def testNoMemoryLeak_graphMode(self):
@@ -987,7 +1017,7 @@ class SummaryWriterTest(test_util.TensorFlowTestCase):
     with context.graph_mode(), ops.Graph().as_default():
       summary_ops.create_file_writer_v2(logdir)
 
-  @test_util.assert_no_new_pyobjects_executing_eagerly
+  @test_util.assert_no_new_pyobjects_executing_eagerly()
   def testNoMemoryLeak_eagerMode(self):
     logdir = self.get_temp_dir()
     with summary_ops.create_file_writer_v2(logdir).as_default():
@@ -1213,6 +1243,7 @@ class SummaryOpsTest(test_util.TensorFlowTestCase):
 
   def tearDown(self):
     summary_ops.trace_off()
+    super().tearDown()
 
   def exec_summary_op(self, summary_op_fn):
     assert context.executing_eagerly()
@@ -1428,8 +1459,7 @@ class SummaryOpsTest(test_util.TensorFlowTestCase):
 
   @test_util.run_v2_only
   def testTrace_cannotExportTraceWithoutTrace(self):
-    with six.assertRaisesRegex(self, ValueError,
-                               'Must enable trace before export.'):
+    with self.assertRaisesRegex(ValueError, 'Must enable trace before export.'):
       summary_ops.trace_export(name='foo', step=1)
 
   @test_util.run_v2_only
@@ -1486,12 +1516,13 @@ class SummaryOpsTest(test_util.TensorFlowTestCase):
     assert context.executing_eagerly()
     logdir = self.get_temp_dir()
     writer = summary_ops.create_file_writer_v2(logdir)
-    summary_ops.trace_on(graph=True, profiler=True)
     profiler_outdir = self.get_temp_dir()
+    summary_ops.trace_on(
+        graph=True, profiler=True, profiler_outdir=profiler_outdir
+    )
     with writer.as_default():
       f()
-      summary_ops.trace_export(
-          name='foo', step=1, profiler_outdir=profiler_outdir)
+      summary_ops.trace_export(name='foo', step=1)
     writer.close()
 
   @test_util.run_v2_only
@@ -1558,6 +1589,159 @@ class SummaryOpsTest(test_util.TensorFlowTestCase):
         r'graph\(\) cannot be invoked inside a graph context.',
     ):
       self.exec_summary_op(summary_op_fn)
+
+
+class WriteScalarSummaryRawOpsTest(test_util.TensorFlowTestCase):
+
+  @test_util.run_in_graph_and_eager_modes
+  def testValidScalarAndSingleElementInputs(self):
+    logdir = self.get_temp_dir()
+    writer = summary_ops.create_file_writer_v2(logdir)
+    self.evaluate(writer.init())
+    step = constant_op.constant(1, dtype=dtypes.int64)
+    tag = constant_op.constant('test_tag', dtype=dtypes.string)
+
+    for val in [2.5, [2.5], [[2.5]]]:
+      t = constant_op.constant(val, dtype=dtypes.float32)
+      self.evaluate(
+          gen_summary_ops.write_scalar_summary(
+              writer=writer._resource,  # pylint: disable=protected-access
+              step=step,
+              tag=tag,
+              value=t,
+          )
+      )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testInvalidEmptyAndMultiElementInputs(self):
+    logdir = self.get_temp_dir()
+    writer = summary_ops.create_file_writer_v2(logdir)
+    self.evaluate(writer.init())
+    step = constant_op.constant(1, dtype=dtypes.int64)
+    tag = constant_op.constant('test_tag', dtype=dtypes.string)
+
+    for invalid_val in [[], [1.0, 2.0], [[1.0, 2.0]]]:
+      t = constant_op.constant(invalid_val, dtype=dtypes.float32)
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, 'must contain exactly one element'
+      ):
+        self.evaluate(
+            gen_summary_ops.write_scalar_summary(
+                writer=writer._resource,  # pylint: disable=protected-access
+                step=step,
+                tag=tag,
+                value=t,
+            )
+        )
+
+
+class SummaryRawOpsSingleElementInputsTest(test_util.TensorFlowTestCase):
+
+  def _create_writer(self):
+    writer = summary_ops.create_file_writer_v2(self.get_temp_dir())
+    self.evaluate(writer.init())
+    return writer
+
+  @test_util.run_in_graph_and_eager_modes
+  def testImportEvent(self):
+    writer = self._create_writer()
+    handle = writer._resource  # pylint: disable=protected-access
+    event = event_pb2.Event(step=1).SerializeToString()
+
+    for valid_event in [event, [event]]:
+      self.evaluate(gen_summary_ops.import_event(handle, valid_event))
+
+    for invalid_event in [[], [event, event]]:
+      t = constant_op.constant(invalid_event, dtype=dtypes.string)
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, 'event must contain exactly one element'
+      ):
+        self.evaluate(gen_summary_ops.import_event(handle, t))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testStepAndTag(self):
+    writer = self._create_writer()
+    handle = writer._resource  # pylint: disable=protected-access
+    image = constant_op.constant(0, dtype=dtypes.uint8, shape=[1, 2, 2, 3])
+    bad_color = constant_op.constant([255, 0, 0, 255], dtype=dtypes.uint8)
+    write_fns = [
+        lambda step, tag: gen_summary_ops.write_summary(
+            handle, step, [1.0], tag, summary_metadata=''
+        ),
+        lambda step, tag: gen_summary_ops.write_scalar_summary(
+            handle, step, tag, 1.0
+        ),
+        lambda step, tag: gen_summary_ops.write_histogram_summary(
+            handle, step, tag, [1.0, 2.0]
+        ),
+        lambda step, tag: gen_summary_ops.write_image_summary(
+            handle, step, tag, image, bad_color
+        ),
+    ]
+
+    for write_fn in write_fns:
+      self.evaluate(write_fn(1, 'tag'))
+      self.evaluate(write_fn([1], ['tag']))
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, 'step must contain exactly one element'
+      ):
+        self.evaluate(write_fn([1, 2], 'tag'))
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, 'tag must contain exactly one element'
+      ):
+        self.evaluate(write_fn(1, ['a', 'b']))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testWriteSummaryMetadata(self):
+    writer = self._create_writer()
+    handle = writer._resource  # pylint: disable=protected-access
+    with self.assertRaisesRegex(
+        errors.InvalidArgumentError,
+        'summary_metadata must contain exactly one element',
+    ):
+      self.evaluate(
+          gen_summary_ops.write_summary(handle, 1, [1.0], 'tag', ['', ''])
+      )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testWriteGraphSummary(self):
+    writer = self._create_writer()
+    handle = writer._resource  # pylint: disable=protected-access
+    graph = graph_pb2.GraphDef().SerializeToString()
+
+    self.evaluate(gen_summary_ops.write_graph_summary(handle, 1, graph))
+    self.evaluate(gen_summary_ops.write_graph_summary(handle, [1], [graph]))
+    with self.assertRaisesRegex(
+        errors.InvalidArgumentError, 'step must contain exactly one element'
+    ):
+      self.evaluate(gen_summary_ops.write_graph_summary(handle, [1, 2], graph))
+    with self.assertRaisesRegex(
+        errors.InvalidArgumentError, 'tensor must contain exactly one element'
+    ):
+      self.evaluate(
+          gen_summary_ops.write_graph_summary(handle, 1, [graph, graph])
+      )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testCreateSummaryDbWriter(self):
+    args = {
+        'db_uri': os.path.join(self.get_temp_dir(), 'summary.db'),
+        'experiment_name': 'experiment',
+        'run_name': 'run',
+        'user_name': 'user',
+    }
+
+    for name in args:
+      invalid_args = {**args, name: ['a', 'b']}
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError,
+          f'{name} must contain exactly one element',
+      ):
+        self.evaluate(
+            gen_summary_ops.create_summary_db_writer(
+                gen_summary_ops.summary_writer(), **invalid_args
+            )
+        )
 
 
 def events_from_file(filepath):

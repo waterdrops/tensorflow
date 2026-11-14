@@ -15,19 +15,21 @@
 """Tests for lookup ops."""
 import os
 import tempfile
+import unittest
 
 from absl.testing import parameterized
 import numpy as np
-import six
 
 from tensorflow.python import tf2
+from tensorflow.python.checkpoint import checkpoint as trackable
+from tensorflow.python.checkpoint import graph_view
+from tensorflow.python.checkpoint import util as checkpoint_util
 from tensorflow.python.client import session
 from tensorflow.python.data.experimental.ops import counter
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.eager import backprop
 from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
-from tensorflow.python.eager import function
 from tensorflow.python.eager import wrap_function
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
@@ -38,7 +40,8 @@ from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_ops
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import cond
+from tensorflow.python.ops import gen_lookup_ops
 from tensorflow.python.ops import lookup_ops
 from tensorflow.python.ops import map_fn
 from tensorflow.python.ops import variables
@@ -46,11 +49,10 @@ from tensorflow.python.ops.ragged import ragged_tensor
 from tensorflow.python.platform import test
 from tensorflow.python.saved_model import load as saved_model_load
 from tensorflow.python.saved_model import save as saved_model_save
+from tensorflow.python.trackable import asset
+from tensorflow.python.trackable import autotrackable
 from tensorflow.python.training import saver
 from tensorflow.python.training import server_lib
-from tensorflow.python.training.tracking import graph_view
-from tensorflow.python.training.tracking import tracking
-from tensorflow.python.training.tracking import util as trackable
 from tensorflow.python.util import compat
 
 
@@ -109,9 +111,29 @@ class StaticHashTableTest(BaseLookupTableTest, parameterized.TestCase):
 
     exported_keys_tensor, exported_values_tensor = table.export()
 
-    self.assertItemsEqual([b"brain", b"salad", b"surgery"],
-                          self.evaluate(exported_keys_tensor))
-    self.assertItemsEqual([0, 1, 2], self.evaluate(exported_values_tensor))
+    self.assertCountEqual(
+        [b"brain", b"salad", b"surgery"], self.evaluate(exported_keys_tensor)
+    )
+    self.assertCountEqual([0, 1, 2], self.evaluate(exported_values_tensor))
+
+  def testExportSignatureMismatch(self, is_anonymous):
+    if is_anonymous and not tf2.enabled():
+      self.skipTest(SKIP_ANONYMOUS_IN_TF1_REASON)
+    table = self.getHashTable()(
+        lookup_ops.KeyValueTensorInitializer(
+            constant_op.constant([0], dtype=dtypes.int64),
+            constant_op.constant([1], dtype=dtypes.int64),
+        ),
+        -1,
+        experimental_is_anonymous=is_anonymous,
+    )
+    self.initialize_table(table)
+    with self.assertRaises((errors_impl.InvalidArgumentError, ValueError)):
+      self.evaluate(
+          gen_lookup_ops.lookup_table_export_v2(
+              table.resource_handle, Tkeys=dtypes.string, Tvalues=dtypes.string
+          )
+      )
 
   def testStaticHashTableFindHighRank(self, is_anonymous):
     if is_anonymous and not tf2.enabled():
@@ -458,7 +480,7 @@ class StaticHashTableTest(BaseLookupTableTest, parameterized.TestCase):
         "n/a",
         experimental_is_anonymous=is_anonymous)
 
-    @function.defun()
+    @def_function.function
     def lookup_table_func(k):
       return table.lookup(k)
 
@@ -473,7 +495,7 @@ class StaticHashTableTest(BaseLookupTableTest, parameterized.TestCase):
     keys = constant_op.constant([0, 1, 2], dtypes.int32)
     values = constant_op.constant(["brain", "salad", "surgery"])
 
-    @function.defun()
+    @def_function.function
     def lookup_table_func(k):
       table = self.getHashTable()(
           lookup_ops.KeyValueTensorInitializer(keys, values),
@@ -562,7 +584,7 @@ class StaticHashTableTest(BaseLookupTableTest, parameterized.TestCase):
       def false_fn():
         return constant_op.constant(0, dtype=dtypes.float32)
 
-      return beta * control_flow_ops.cond(
+      return beta * cond.cond(
           constant_op.constant(True), true_fn=true_fn, false_fn=false_fn)
 
     with backprop.GradientTape() as tape:
@@ -571,6 +593,20 @@ class StaticHashTableTest(BaseLookupTableTest, parameterized.TestCase):
     self.evaluate(variables.global_variables_initializer())
     self.evaluate(lookup_ops.tables_initializer())
     self.assertAllEqual(grad, -10.)
+
+  def testImportShapeInference(self, is_anonymous):
+    v = variables.Variable(1)
+
+    @def_function.function(jit_compile=True)
+    def foo():
+      return gen_lookup_ops.lookup_table_import_v2(
+          table_handle=v.handle, keys=[1.1, 2.2], values=1
+      )
+
+    with self.assertRaisesRegex(
+        ValueError, r"Shape must be at least rank 1 but is rank 0"
+    ):
+      foo()
 
   def testExportShapeInference(self, is_anonymous):
     table = self.getHashTable()(
@@ -593,12 +629,58 @@ class StaticHashTableTest(BaseLookupTableTest, parameterized.TestCase):
     self.assertTrue(inferred_shapes[0].is_compatible_with(actual_shapes[0]))
     self.assertTrue(inferred_shapes[1].is_compatible_with(actual_shapes[1]))
 
+  def testImportInvalidNumBuckets(self, is_anonymous):
+    if is_anonymous and not tf2.enabled():
+      self.skipTest(SKIP_ANONYMOUS_IN_TF1_REASON)
+    table = lookup_ops.DenseHashTable(
+        dtypes.string,
+        dtypes.float32,
+        default_value=-1.5,
+        empty_key="",
+        deleted_key="$",
+        experimental_is_anonymous=is_anonymous,
+    )
+
+    # Test empty keys (num_buckets = 0)
+    empty_keys = constant_op.constant([], dtypes.string)
+    empty_values = constant_op.constant([], dtypes.float32)
+    with self.assertRaises((ValueError, errors_impl.InvalidArgumentError)):
+      self.evaluate(
+          gen_lookup_ops.lookup_table_import_v2(
+              table.resource_handle, empty_keys, empty_values
+          )
+      )
+
+    # Test num_buckets < 4 (e.g. 2)
+    invalid_keys = constant_op.constant(["a", "b"], dtypes.string)
+    invalid_values = constant_op.constant([1.0, 2.0], dtypes.float32)
+    with self.assertRaises((ValueError, errors_impl.InvalidArgumentError)):
+      self.evaluate(
+          gen_lookup_ops.lookup_table_import_v2(
+              table.resource_handle, invalid_keys, invalid_values
+          )
+      )
+
+    # Test num_buckets not power of 2 (e.g. 5)
+    invalid_keys = constant_op.constant(
+        ["a", "b", "c", "d", "e"], dtypes.string
+    )
+    invalid_values = constant_op.constant(
+        [1.0, 2.0, 3.0, 4.0, 5.0], dtypes.float32
+    )
+    with self.assertRaises((ValueError, errors_impl.InvalidArgumentError)):
+      self.evaluate(
+          gen_lookup_ops.lookup_table_import_v2(
+              table.resource_handle, invalid_keys, invalid_values
+          )
+      )
+
   @test_util.run_v2_only
   def testSavedModelSaveRestore(self, is_anonymous):
     save_dir = os.path.join(self.get_temp_dir(), "save_restore")
     save_path = os.path.join(tempfile.mkdtemp(prefix=save_dir), "hash")
 
-    root = tracking.AutoTrackable()
+    root = autotrackable.AutoTrackable()
 
     default_value = -1
     keys = constant_op.constant([11, 12, 13], dtypes.int64)
@@ -833,6 +915,110 @@ class InitializeTableFromFileOpTest(BaseLookupTableTest):
             init, default_value, experimental_is_anonymous=is_anonymous)
         self.initialize_table(table)
 
+  def testOversizeColumnIndex(self, is_anonymous):
+    # A column index that overflows int32 (the op attr is a plain int) used to
+    # be truncated when passed to the initializer, wrapping a large positive
+    # index into a negative one that then indexed the split tokens out of
+    # bounds. It must be rejected the same way any other too-large column index
+    # is, rather than producing a negative token index.
+    # 2**31 narrows to INT32_MIN, 2**32 - 1 wraps a 32-bit size_t column count,
+    # and 2**63 - 1 overflows int64 when the count is computed.
+    vocabulary_file = os.path.join(self.get_temp_dir(), "three_columns_oob.txt")
+    with open(vocabulary_file, "w") as f:
+      f.write("\n".join(["0\tbrain\t1", "1\tsalad\t5", "2\tsurgery\t6"]) + "\n")
+
+    for oversize_index in (2**31, 2**32 - 1, 2**63 - 1):
+      for key_index, value_index in (
+          (0, oversize_index),
+          (oversize_index, 1),
+      ):
+        with self.cached_session():
+          init = lookup_ops.TextFileInitializer(
+              vocabulary_file,
+              dtypes.string,
+              key_index,
+              dtypes.int64,
+              value_index,
+          )
+          with self.assertRaisesOpError("Invalid number of columns"):
+            table = self.getHashTable()(
+                init, -1, experimental_is_anonymous=is_anonymous
+            )
+            self.initialize_table(table)
+
+  def testOffsetOverflow(self, is_anonymous):
+    vocabulary_file = self._createVocabFile(
+        "offset_overflow.txt", values=("10", "20")
+    )
+    with self.cached_session():
+      for bad_offset in (2**31 - 10, -(2**31) - 11, 2**63 - 1, -(2**63)):
+        init = lookup_ops.TextFileInitializer(
+            vocabulary_file,
+            dtypes.string,
+            lookup_ops.TextFileIndex.WHOLE_LINE,
+            dtypes.int32,
+            lookup_ops.TextFileIndex.WHOLE_LINE,
+            value_index_offset=bad_offset,
+        )
+        with self.assertRaisesOpError("overflows int32"):
+          table = self.getHashTable()(
+              init, -1, experimental_is_anonymous=is_anonymous
+          )
+          self.initialize_table(table)
+
+      init = lookup_ops.TextFileInitializer(
+          vocabulary_file,
+          dtypes.string,
+          lookup_ops.TextFileIndex.WHOLE_LINE,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.LINE_NUMBER,
+          value_index_offset=2**63 - 1,
+      )
+      with self.assertRaisesOpError("overflows int64"):
+        table = self.getHashTable()(
+            init, -1, experimental_is_anonymous=is_anonymous
+        )
+        self.initialize_table(table)
+
+  def testInt64WholeLineIgnoresOffset(self, is_anonymous):
+    if is_anonymous and not tf2.enabled():
+      self.skipTest(SKIP_ANONYMOUS_IN_TF1_REASON)
+    vocabulary_file = self._createVocabFile(
+        "int64_offset_vocab.txt", values=("42", "7")
+    )
+    with self.cached_session():
+      init_fwd = lookup_ops.TextFileInitializer(
+          vocabulary_file,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.WHOLE_LINE,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.LINE_NUMBER,
+          value_index_offset=1,
+      )
+      table_fwd = self.getHashTable()(
+          init_fwd, -1, experimental_is_anonymous=is_anonymous
+      )
+      self.initialize_table(table_fwd)
+      out_fwd = table_fwd.lookup(
+          constant_op.constant([42, 7, 43], dtypes.int64)
+      )
+      self.assertAllEqual([1, 2, -1], self.evaluate(out_fwd))
+
+      init_inv = lookup_ops.TextFileInitializer(
+          vocabulary_file,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.LINE_NUMBER,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.WHOLE_LINE,
+          value_index_offset=1,
+      )
+      table_inv = self.getHashTable()(
+          init_inv, -1, experimental_is_anonymous=is_anonymous
+      )
+      self.initialize_table(table_inv)
+      out_inv = table_inv.lookup(constant_op.constant([0, 1, 2], dtypes.int64))
+      self.assertAllEqual([-1, 42, 7], self.evaluate(out_inv))
+
   def testInitializeSameTableWithMultipleNodes(self, is_anonymous):
     if is_anonymous and not tf2.enabled():
       self.skipTest(SKIP_ANONYMOUS_IN_TF1_REASON)
@@ -871,6 +1057,117 @@ class InitializeTableFromFileOpTest(BaseLookupTableTest):
       self.assertAllEqual([0, 1, -1], out1)
       self.assertAllEqual([0, 1, -1], out2)
       self.assertAllEqual([0, 1, -1], out3)
+
+  def testInitializeSameFileWithDifferentDtypes(self, is_anonymous):
+    if is_anonymous and not tf2.enabled():
+      self.skipTest(SKIP_ANONYMOUS_IN_TF1_REASON)
+    vocabulary_file = self._createVocabFile(
+        "one_column_dtypes.txt", ("1", "2", "3")
+    )
+
+    with self.cached_session():
+      default_value = -1
+      init1 = lookup_ops.TextFileInitializer(
+          vocabulary_file,
+          dtypes.string,
+          lookup_ops.TextFileIndex.WHOLE_LINE,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.LINE_NUMBER,
+      )
+      self.assertIn(
+          "one_column_dtypes.txt_-2_-1_string_int64", init1._shared_name
+      )
+      table1 = self.getHashTable()(
+          init1, default_value, experimental_is_anonymous=is_anonymous
+      )
+      init2 = lookup_ops.TextFileInitializer(
+          vocabulary_file,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.WHOLE_LINE,
+          dtypes.int64,
+          lookup_ops.TextFileIndex.LINE_NUMBER,
+      )
+      self.assertIn(
+          "one_column_dtypes.txt_-2_-1_int64_int64", init2._shared_name
+      )
+      self.assertNotEqual(init1._shared_name, init2._shared_name)
+      table2 = self.getHashTable()(
+          init2, default_value, experimental_is_anonymous=is_anonymous
+      )
+
+      self.evaluate(lookup_ops.tables_initializer())
+
+      output1 = table1.lookup(
+          constant_op.constant(["1", "2", "4"], dtype=dtypes.string)
+      )
+      output2 = table2.lookup(
+          constant_op.constant([1, 2, 4], dtype=dtypes.int64)
+      )
+
+      out1, out2 = self.evaluate([output1, output2])
+      self.assertAllEqual([0, 1, -1], out1)
+      self.assertAllEqual([0, 1, -1], out2)
+
+  def testTextFileInitializerSharedNameCombinations(self, is_anonymous):
+    del is_anonymous
+    filename = "test_vocab.txt"
+    key_dtype = dtypes.string
+    key_index = lookup_ops.TextFileIndex.WHOLE_LINE
+    value_dtype = dtypes.int64
+    value_index = lookup_ops.TextFileIndex.LINE_NUMBER
+
+    for vocab_size in (None, 10):
+      for offset in (0, 5):
+        init = lookup_ops.TextFileInitializer(
+            filename,
+            key_dtype,
+            key_index,
+            value_dtype,
+            value_index,
+            vocab_size=vocab_size,
+            value_index_offset=offset,
+        )
+
+        if vocab_size:
+          if offset:
+            expected = "hash_table_%s_%d_%s_%s_%s_%s_%s" % (
+                filename,
+                vocab_size,
+                key_index,
+                value_index,
+                offset,
+                key_dtype.name,
+                value_dtype.name,
+            )
+          else:
+            expected = "hash_table_%s_%d_%s_%s_%s_%s" % (
+                filename,
+                vocab_size,
+                key_index,
+                value_index,
+                key_dtype.name,
+                value_dtype.name,
+            )
+        else:
+          if offset:
+            expected = "hash_table_%s_%s_%s_%s_%s_%s" % (
+                filename,
+                key_index,
+                value_index,
+                offset,
+                key_dtype.name,
+                value_dtype.name,
+            )
+          else:
+            expected = "hash_table_%s_%s_%s_%s_%s" % (
+                filename,
+                key_index,
+                value_index,
+                key_dtype.name,
+                value_dtype.name,
+            )
+
+        self.assertEqual(expected, init._shared_name)
 
   def testInitializeTableWithNoFilename(self, is_anonymous):
     with self.cached_session():
@@ -1265,9 +1562,8 @@ class StaticVocabularyTableTest(BaseLookupTableTest):
             vocab_file, vocab_size=vocab_size),
         oov_buckets,
         experimental_is_anonymous=is_anonymous)
-    object_graph_view = graph_view.ObjectGraphView(table)
-    objects = object_graph_view.list_objects()
-    assets = list(filter(lambda obj: isinstance(obj, tracking.Asset), objects))
+    objects = checkpoint_util.list_objects(graph_view.ObjectGraphView(table))
+    assets = list(filter(lambda obj: isinstance(obj, asset.Asset), objects))
     self.assertLen(assets, 1)
     self.assertEqual(
         self.evaluate(assets[0].asset_path), compat.as_bytes(vocab_file))
@@ -1445,7 +1741,7 @@ class StaticVocabularyTableTest(BaseLookupTableTest):
     save_dir = os.path.join(self.get_temp_dir(), "save_restore")
     save_path = os.path.join(tempfile.mkdtemp(prefix=save_dir), "hash")
 
-    root = tracking.AutoTrackable()
+    root = autotrackable.AutoTrackable()
 
     vocab_file = self._createVocabFile("feat_to_id_3.txt", ("11", "12", "13"))
     vocab_size = 3
@@ -1861,7 +2157,7 @@ class DenseHashTableOpTest(test.TestCase):
       self.assertAllEqual(32, len(table.export()[0].eval()))
 
       val = save.save(sess, save_path)
-      self.assertIsInstance(val, six.string_types)
+      self.assertIsInstance(val, str)
       self.assertEqual(save_path, val)
 
     with self.session(graph=ops.Graph()) as sess:
@@ -1930,7 +2226,7 @@ class DenseHashTableOpTest(test.TestCase):
       self.assertAllEqual(32, len(table.export()[0].eval()))
 
       val = save.save(sess, save_path)
-      self.assertIsInstance(val, six.string_types)
+      self.assertIsInstance(val, str)
       self.assertEqual(save_path, val)
 
     with self.session(graph=ops.Graph()) as sess:
@@ -2029,7 +2325,7 @@ class DenseHashTableOpTest(test.TestCase):
     save_dir = os.path.join(self.get_temp_dir(), "save_restore")
     save_path = os.path.join(tempfile.mkdtemp(prefix=save_dir), "hash")
 
-    root = tracking.AutoTrackable()
+    root = autotrackable.AutoTrackable()
 
     default_value = -1
     empty_key = 0
@@ -2121,7 +2417,7 @@ class DenseHashTableOpTest(test.TestCase):
       self.assertAllEqual(32, len(table.export()[0].eval()))
 
       val = save.save(sess, save_path)
-      self.assertIsInstance(val, six.string_types)
+      self.assertIsInstance(val, str)
       self.assertEqual(save_path, val)
 
     with self.session(graph=ops.Graph()) as sess:
@@ -2196,7 +2492,7 @@ class DenseHashTableOpTest(test.TestCase):
       self.assertAllEqual(32, len(table.export()[0].eval()))
 
       val = save.save(sess, save_path)
-      self.assertIsInstance(val, six.string_types)
+      self.assertIsInstance(val, str)
       self.assertEqual(save_path, val)
 
     with self.session(graph=ops.Graph()) as sess:
@@ -3354,6 +3650,31 @@ class MutableHashTableOpTest(test.TestCase):
     self.assertAllEqual([b"brain", b"salad", b"surgery"], sorted_keys)
     self.assertAllEqual([0, 1, 2], sorted_values)
 
+  # TODO(https://github.com/tensorflow/tensorflow/issues/24439): remove exepectedFailure when fixed
+  @unittest.expectedFailure
+  @test_util.run_v2_only
+  def testImportedHashTable(self, is_anonymous):
+    g = ops.Graph()
+    with g.as_default():
+      default_val = -1
+      keys = constant_op.constant(["brain", "salad", "surgery", "tarkus"])
+      values = constant_op.constant([0, 1, 2, 3], dtypes.int64)
+      table = lookup_ops.MutableHashTable(
+          dtypes.string,
+          dtypes.int64,
+          default_val,
+          experimental_is_anonymous=is_anonymous)
+      self.evaluate(table.insert(keys, values))
+      op = table.lookup(constant_op.constant(["brain", "salad", "tank"]))
+      meta_graph = saver.export_meta_graph()
+
+    def f():
+      saver.import_meta_graph(meta_graph)
+      return ops.get_default_graph().get_tensor_by_name(op.name)
+
+    wrapped = wrap_function.wrap_function(f, [])
+    self.assertAllEqual([0, 1, -1], wrapped())
+
   @test_util.run_v1_only("SaverV1")
   def testSaveRestore(self, is_anonymous):
     if is_anonymous and not tf2.enabled():
@@ -3388,7 +3709,7 @@ class MutableHashTableOpTest(test.TestCase):
       self.assertAllEqual(3, self.evaluate(table.size()))
 
       val = save.save(sess, save_path)
-      self.assertIsInstance(val, six.string_types)
+      self.assertIsInstance(val, str)
       self.assertEqual(save_path, val)
 
     with self.session(graph=ops.Graph()) as sess:
@@ -3457,7 +3778,7 @@ class MutableHashTableOpTest(test.TestCase):
       self.assertAllEqual(3, self.evaluate(table.size()))
 
       val = save.save(sess, save_path)
-      self.assertIsInstance(val, six.string_types)
+      self.assertIsInstance(val, str)
       self.assertEqual(save_path, val)
 
     with self.session(graph=ops.Graph()) as sess:
@@ -3559,7 +3880,7 @@ class MutableHashTableOpTest(test.TestCase):
     save_dir = os.path.join(self.get_temp_dir(), "save_restore")
     save_path = os.path.join(tempfile.mkdtemp(prefix=save_dir), "hash")
 
-    root = tracking.AutoTrackable()
+    root = autotrackable.AutoTrackable()
 
     default_value = -1
     keys = constant_op.constant([11, 12, 13], dtypes.int64)
@@ -4184,6 +4505,29 @@ class MutableHashTableOpTest(test.TestCase):
     self.assertLen(inferred_shapes, 2)
     self.assertTrue(inferred_shapes[0].is_compatible_with(actual_shapes[0]))
     self.assertTrue(inferred_shapes[1].is_compatible_with(actual_shapes[1]))
+
+
+class ResourceHandleNameSecurityTest(test.TestCase):
+  """Verify that anonymous resource handle names do not leak heap addresses."""
+
+  @test_util.run_v2_only
+  def testAnonymousHashTableHandleDoesNotLeakAddress(self):
+    # AnonymousHashTable creates a ResourceBase whose handle name was
+    # previously formatted as "Resource-<id>-at-0x<hex_address>", leaking
+    # the glibc heap address to callers via error messages.
+    table = gen_lookup_ops.anonymous_hash_table(
+        key_dtype=dtypes.int64, value_dtype=dtypes.int64
+    )
+    handle_name = str(table)
+    self.assertRegex(handle_name, r'name="Resource-\d+"')
+    self.assertNotIn(
+        "-at-", handle_name, "Handle name must not contain raw pointer"
+    )
+    self.assertNotRegex(
+        handle_name,
+        r"0x[0-9a-fA-F]{8,}",
+        "Handle name must not contain hex address",
+    )
 
 
 class MutableHashTableBenchmark(test.Benchmark):

@@ -14,11 +14,13 @@
 # ==============================================================================
 """Converts a model's graph def into a tflite model with MLIR-based conversion."""
 import os
+import shlex
+import subprocess
 import tempfile
 
 import numpy as np
-import tensorflow as tf
 
+from tensorflow.lite.python import lite
 from tensorflow.lite.python import test_util as tflite_test_util
 from tensorflow.lite.testing import zip_test_utils
 from tensorflow.python.platform import resource_loader
@@ -45,17 +47,15 @@ def mlir_convert(
     or None, log_txt if it did not convert properly.
   """
   test_params = kwargs.get("test_params", {})
-  # TODO(b/146025965): Rename ExtraTocoOptions to ExtraConvertOptions or
-  #                    something else.
-  extra_toco_options = kwargs.get("extra_toco_options",
-                                  zip_test_utils.ExtraTocoOptions())
+  extra_convert_options = kwargs.get("extra_convert_options",
+                                     zip_test_utils.ExtraConvertOptions())
   tflite_model = None
   log = ""
 
   signature_key = signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY
-  converter = tf.lite.TFLiteConverter.from_saved_model(
+  converter = lite.TFLiteConverterV2.from_saved_model(
       saved_model_dir, [signature_key])
-  converter.allow_custom_ops = extra_toco_options.allow_custom_ops
+  converter.allow_custom_ops = extra_convert_options.allow_custom_ops
   converter.experimental_new_quantizer = options.mlir_quantizer
   if options.make_tf_ptq_tests:
     if options.hlo_aware_conversion:
@@ -66,13 +66,28 @@ def mlir_convert(
 
   if options.run_with_flex:
     converter.target_spec.supported_ops = set(
-        [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS])
+        [lite.OpsSet.TFLITE_BUILTINS, lite.OpsSet.SELECT_TF_OPS])
+
+  if options.enable_dynamic_update_slice:
+    converter._experimental_enable_dynamic_update_slice = True  # pylint: disable=protected-access
+
+  converter.unfold_batchmatmul = options.unfold_batchmatmul
 
   if test_params.get("dynamic_range_quantize", False):
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.optimizations = [lite.Optimize.DEFAULT]
+
+  if options.experimental_low_bit_qat:
+    converter._experimental_low_bit_qat = (   # pylint: disable=protected-access
+        True
+    )
+
+  if options.experimental_unsafe_single_batch_rank_reduction:
+    converter._experimental_unsafe_single_batch_rank_reduction = (  # pylint: disable=protected-access
+        True
+    )
 
   if test_params.get("fully_quantize", False):
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.optimizations = [lite.Optimize.DEFAULT]
 
     # Read the input range for the representative dataset from parameters.
     min_value, max_value = test_params.get("input_range", (-1, 1))
@@ -92,22 +107,22 @@ def mlir_convert(
 
     if test_params.get("quant_16x8", False):
       converter.target_spec.supported_ops = [
-          tf.lite.OpsSet
+          lite.OpsSet
           .EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
       ]
     else:
       converter.target_spec.supported_ops = [
-          tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+          lite.OpsSet.TFLITE_BUILTINS_INT8
       ]
 
     converter.representative_dataset = representative_dataset_gen
-    if extra_toco_options.inference_input_type:
+    if extra_convert_options.inference_input_type:
       converter.inference_input_type = (
-          extra_toco_options.inference_input_type)
+          extra_convert_options.inference_input_type)
 
-    if extra_toco_options.inference_output_type:
+    if extra_convert_options.inference_output_type:
       converter.inference_output_type = (
-          extra_toco_options.inference_output_type)
+          extra_convert_options.inference_output_type)
 
   try:
     tflite_model = converter.convert()
@@ -151,10 +166,14 @@ def mlir_convert_file(graph_def_filename,
     or None, log_txt if it did not convert properly.
   """
   bin_path = resource_loader.get_path_to_datafile(
-      "../../../../compiler/mlir/lite/tf_tfl_translate")
+      "../../compiler/mlir/lite/tf_tfl_translate"
+  )
+  if not os.path.exists(bin_path):
+    bin_path = resource_loader.get_path_to_datafile(
+        "../../../../compiler/mlir/lite/tf_tfl_translate"
+    )
 
-  with tempfile.NamedTemporaryFile() as output_file, \
-       tempfile.NamedTemporaryFile("w+") as stdout_file:
+  with tempfile.NamedTemporaryFile() as output_file:
     input_shapes = []
     for input_tensor in input_tensors:
       shape = input_tensor[1]
@@ -163,28 +182,53 @@ def mlir_convert_file(graph_def_filename,
 
     input_types = ",".join([x[2] for x in input_tensors])
 
-    quant_flags = ""
+    cmd_list = [
+        bin_path,
+        "-tf-input-arrays=" + ",".join([x[0] for x in input_tensors]),
+        "-tf-input-data-types=" + input_types,
+        "-tf-input-shapes=" + input_shapes_str,
+        "-tf-output-arrays=" + ",".join(output_tensors),
+    ]
     if quantization_params is not None:
       min_vals = ",".join([str(val) for val in quantization_params[1]])
       max_vals = ",".join([str(val) for val in quantization_params[2]])
-      quant_flags = ("-tf-inference-type=" + quantization_params[0] +
-                     " -tf-input-min-values='" + min_vals +
-                     "' -tf-input-max-values='" + max_vals + "' " +
-                     "-emit-quant-adaptor-ops ")
-    cmd = ("%s -tf-input-arrays=%s -tf-input-data-types=%s -tf-input-shapes=%s "
-           "-tf-output-arrays=%s " + quant_flags + additional_flags +
-           "%s -o %s")
-    cmd = cmd % (
-        bin_path,
-        ",".join([x[0] for x in input_tensors]),
-        input_types,
-        input_shapes_str,
-        ",".join(output_tensors),
-        graph_def_filename,
-        output_file.name,
-    )
-    exit_code = os.system(cmd)
+      cmd_list.extend([
+          "-tf-inference-type=" + quantization_params[0],
+          "-tf-input-min-values=" + min_vals,
+          "-tf-input-max-values=" + max_vals,
+          "-emit-quant-adaptor-ops",
+      ])
+
+    if additional_flags:
+      cmd_list.extend(shlex.split(additional_flags))
+
+    cmd_list.extend([graph_def_filename, "-o", output_file.name])
+
+    try:
+      with tempfile.NamedTemporaryFile() as stdout_file:
+        with tempfile.NamedTemporaryFile() as stderr_file:
+          result = subprocess.run(
+              cmd_list, stdout=stdout_file, stderr=stderr_file, check=False
+          )
+          exit_code = result.returncode
+          stdout_file.seek(0)
+          stderr_file.seek(0)
+          stdout = stdout_file.read().decode("utf-8", errors="replace")
+          stderr = stderr_file.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+      exit_code = 127
+      stdout = ""
+      stderr = "Command not found: " + bin_path
+    except PermissionError:
+      exit_code = 126
+      stdout = ""
+      stderr = "Permission denied: " + bin_path
+
     log = (
-        cmd + "exited with code %d" % exit_code + "\n------------------\n" +
-        stdout_file.read())
+        " ".join(cmd_list)
+        + " exited with code %d" % exit_code
+        + "\n------------------\n"
+        + stdout
+        + stderr
+    )
     return (None if exit_code != 0 else output_file.read()), log

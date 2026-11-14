@@ -115,27 +115,29 @@ class ShapeOpsTest(test.TestCase):
     self.assertAllEqual(np_ans, result)
     self.assertShapeEqual(np_ans, tf_ans)
 
-  def _testCpu(self, x):
+  def _testCpu(self, x, compare_sparse):
     self._compareShape(x, use_gpu=False)
     self._compareShapeN(x, use_gpu=False)
     self._compareRank(x, use_gpu=False)
     self._compareSize(x, use_gpu=False)
-    self._compareShapeSparse(x, use_gpu=False)
-    self._compareRankSparse(x, use_gpu=False)
-    self._compareSizeSparse(x, use_gpu=False)
+    if compare_sparse:
+      self._compareShapeSparse(x, use_gpu=False)
+      self._compareRankSparse(x, use_gpu=False)
+      self._compareSizeSparse(x, use_gpu=False)
 
-  def _testGpu(self, x):
+  def _testGpu(self, x, compare_sparse):
     self._compareShape(x, use_gpu=True)
     self._compareShapeN(x, use_gpu=True)
     self._compareRank(x, use_gpu=True)
     self._compareSize(x, use_gpu=True)
-    self._compareShapeSparse(x, use_gpu=True)
-    self._compareRankSparse(x, use_gpu=True)
-    self._compareSizeSparse(x, use_gpu=True)
+    if compare_sparse:
+      self._compareShapeSparse(x, use_gpu=True)
+      self._compareRankSparse(x, use_gpu=True)
+      self._compareSizeSparse(x, use_gpu=True)
 
-  def _testAll(self, x):
-    self._testCpu(x)
-    self._testGpu(x)
+  def _testAll(self, x, compare_sparse=True):
+    self._testCpu(x, compare_sparse)
+    self._testGpu(x, compare_sparse)
 
   def testBasic(self):
     self._testAll(np.random.randn(2))
@@ -145,6 +147,15 @@ class ShapeOpsTest(test.TestCase):
     self._testAll(np.random.randn(2, 3, 5, 7, 11))
     self._testAll(np.random.randn(2, 3, 5, 7, 11, 13))
 
+  @test_util.run_deprecated_v1
+  def testOutTypeMustBeIntegral(self):
+    # Regression test: when the input's shape is fully known at graph
+    # construction time, shape() takes a constant-folding shortcut that
+    # used to skip the out_type validation the Shape op itself enforces.
+    x = constant_op.constant([1.0, 2.0, 3.0, 4.0])
+    with self.assertRaisesRegex(ValueError, "out_type"):
+      array_ops.shape(x, out_type=dtypes.float32)
+
   def testBool(self):
     self._testAll(np.random.choice((False, True), size=(2,)))
     self._testAll(np.random.choice((False, True), size=(2, 3)))
@@ -152,6 +163,29 @@ class ShapeOpsTest(test.TestCase):
     self._testAll(np.random.choice((False, True), size=(2, 3, 5, 7)))
     self._testAll(np.random.choice((False, True), size=(2, 3, 5, 7, 11)))
     self._testAll(np.random.choice((False, True), size=(2, 3, 5, 7, 11, 13)))
+
+  def testString(self):
+    self._testAll(
+        np.random.choice(["abcd", "efgh"], size=(2,)), compare_sparse=False
+    )
+    self._testAll(
+        np.random.choice(["abcd", "efgh"], size=(2, 3)), compare_sparse=False
+    )
+    self._testAll(
+        np.random.choice(["abcd", "efgh"], size=(2, 3, 5)), compare_sparse=False
+    )
+    self._testAll(
+        np.random.choice(["abcd", "efgh"], size=(2, 3, 5, 7)),
+        compare_sparse=False,
+    )
+    self._testAll(
+        np.random.choice(["abcd", "efgh"], size=(2, 3, 5, 7, 11)),
+        compare_sparse=False,
+    )
+    self._testAll(
+        np.random.choice(["abcd", "efgh"], size=(2, 3, 5, 7, 11, 13)),
+        compare_sparse=False,
+    )
 
   # Disabled because it takes too long to run, but manually verified
   # as passing at time of writing.
@@ -377,6 +411,32 @@ class ShapeOpsTest(test.TestCase):
         self.assertRaises(ValueError, array_ops.squeeze,
                           np.zeros([1, 2, 1]), [2, 3])
 
+  def testSqueezeWithTensorAxisError(self):
+    """Test that passing a Tensor as axis raises TypeError (issue #62504)."""
+    # Test with int tensor
+    input_tensor = constant_op.constant([[1, 2, 3]], dtype=dtypes.float32)
+    axis_tensor = constant_op.constant(0, dtype=dtypes.int32)
+    with self.assertRaisesRegex(
+        TypeError, r"axis.*must be.*integer.*list.*not a Tensor"
+    ):
+      array_ops.squeeze(input_tensor, axis_tensor)
+
+    # Test with float tensor
+    input_tensor = constant_op.constant([1, 2, 3], dtype=dtypes.float32)
+    axis_tensor = constant_op.constant(0.0, dtype=dtypes.float32)
+    with self.assertRaisesRegex(
+        TypeError, r"axis.*must be.*integer.*list.*not a Tensor"
+    ):
+      array_ops.squeeze(input_tensor, axis_tensor)
+
+    # Test with a list containing a Tensor
+    input_tensor = constant_op.constant([[1, 2, 3]], dtype=dtypes.float32)
+    axis_list = [constant_op.constant(0, dtype=dtypes.int32)]
+    with self.assertRaisesRegex(
+        TypeError, r"axis.*must be.*integer.*list.*cannot.*contain Tensors"
+    ):
+      array_ops.squeeze(input_tensor, axis_list)
+
   @test_util.run_deprecated_v1
   def testSqueezeGradient(self):
     with self.cached_session():
@@ -487,6 +547,8 @@ class TileTest(test.TestCase, parameterized.TestCase):
   def testTypes(self):
     types_to_test = {
         "bool": (dtypes.bool, bool),
+        "bfloat16": (dtypes.bfloat16, float),
+        "float16": (dtypes.float16, float),
         "float32": (dtypes.float32, float),
         "float64": (dtypes.float64, float),
         "complex64": (dtypes.complex64, complex),
@@ -724,7 +786,7 @@ class TileTest(test.TestCase, parameterized.TestCase):
     if test_util.is_xla_enabled():
       # The following test fails with XLA enabled.
       return
-    with self.assertRaises(errors_impl.InternalError):
+    with self.assertRaises(errors_impl.InvalidArgumentError):
       with self.cached_session():
         tiled = array_ops.tile(
             np.ones((1, 1, 1)), [100000000, 100000000, 100000000])

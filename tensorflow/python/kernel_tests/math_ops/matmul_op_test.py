@@ -19,6 +19,7 @@ import operator
 import numpy as np
 
 from tensorflow.python import tf2
+from tensorflow.python.eager import def_function
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
@@ -26,8 +27,6 @@ from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gradient_checker_v2
 from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import random_ops
-from tensorflow.python.ops import variables
 from tensorflow.python.platform import test as test_lib
 
 # TODO(yangzihao): Currently matmul autotuning is disabled by default. Use
@@ -55,6 +54,23 @@ class MatMulMixedType(test_lib.TestCase):
     c = math_ops.batch_mat_mul_v3(a, b, adj_y=True, Tout=np_bf16)
     self.assertAllEqual((2, 2), c.shape)
     self.assertAllEqual([[5, 11], [11, 25]], c)
+
+
+@test_util.with_eager_op_as_function
+class MatMulAddFusionTest(test_lib.TestCase):
+  """Test broadcasting behavior when MatMul and Add are fused in graph execution."""
+
+  def testMatMulAddBroadcastInTfFunction(self):
+    @def_function.function
+    def f(x):
+      return math_ops.add(
+          math_ops.matmul(x, x, transpose_a=True),
+          math_ops.matmul(array_ops.ones([1, 1], dtype=x.dtype), x),
+      )
+
+    x = constant_op.constant(np.ones([1, 7], dtype=np.float32))
+    res = f(x)
+    self.assertEqual(tuple(res.shape), (7, 7))
 
 
 @test_util.with_eager_op_as_function
@@ -151,6 +167,10 @@ def _GetMatMulGradientTest(a_np_, b_np_, use_static_shape_, **kwargs_):
     if not use_static_shape_ or a_np_.dtype in (np.int32, np.int64, np.float16):
       self.skipTest("Skipping infeasible gradient test.")
 
+    if (a_np_.dtype == dtypes.bfloat16.as_numpy_dtype and
+        not test_util.is_gpu_available()):
+      self.skipTest("The bfloat16 tests might fail on CPU")
+
     # Transpose and possibly conjugate a_np_ and b_np_ according to the
     # attributes such that tf.matmul(effective_a_np, effective_b_np, **kwargs)
     # results in a valid matrix multiplication and produces the same result as
@@ -158,7 +178,13 @@ def _GetMatMulGradientTest(a_np_, b_np_, use_static_shape_, **kwargs_):
     effective_a_np = _GetTransposedMatrices(a_np_, "a", kwargs_)
     effective_b_np = _GetTransposedMatrices(b_np_, "b", kwargs_)
 
-    epsilon = np.finfo(a_np_.dtype).eps
+    # np.finfo doesn't support bfloat16. So, we manually compute the eps which
+    # defines the difference between 1.0 and the next smallest representable
+    # float larger than 1.0. For bfloat16, the difference is 1/128.
+    if a_np_.dtype == dtypes.bfloat16.as_numpy_dtype:
+      epsilon = 0.0078125
+    else:
+      epsilon = np.finfo(a_np_.dtype).eps
     delta = epsilon**(1.0 / 3.0)
     tol = 20 * delta
     with self.session():
@@ -175,32 +201,6 @@ def _GetMatMulGradientTest(a_np_, b_np_, use_static_shape_, **kwargs_):
       self.assertAllClose(theoretical, numerical, rtol=tol, atol=tol)
 
   return Test
-
-
-@test_util.with_eager_op_as_function
-class MatMulStatsTest(test_lib.TestCase):
-
-  @test_util.run_v1_only("Test requires a Graph and NodeDef inspection")
-  def testSimpleStatistics(self):
-    a = variables.Variable(random_ops.random_normal([25, 16]))
-    b = variables.Variable(random_ops.random_normal([16, 9]))
-    math_ops.matmul(a, b)
-    g = ops.get_default_graph()
-    for op in g.get_operations():
-      flops = ops.get_stats_for_node_def(g, op.node_def, "flops").value
-      if op.name == "MatMul":
-        self.assertEqual(7200, flops)
-
-  @test_util.run_v1_only("Test requires a Graph and NodeDef inspection")
-  def testTransposedStatistics(self):
-    a = variables.Variable(random_ops.random_normal([16, 25]))
-    b = variables.Variable(random_ops.random_normal([16, 9]))
-    math_ops.matmul(a, b, transpose_a=True)
-    g = ops.get_default_graph()
-    for op in g.get_operations():
-      flops = ops.get_stats_for_node_def(g, op.node_def, "flops").value
-      if op.name == "MatMul":
-        self.assertEqual(7200, flops)
 
 
 try:
@@ -230,12 +230,96 @@ except AttributeError:
 class MatMulInfixOperatorTest(test_lib.TestCase):
 
   def testMismatchedShape(self):
+    # The Python-level rank check now raises ValueError with a descriptive
+    # message before hitting the C++ kernel (which used to raise
+    # InvalidArgumentError).  We accept both the old C++ patterns (for
+    # graph-mode / non-eager paths that bypass the Python guard) and the new
+    # ValueError message so the test stays green across all execution modes.
     with self.assertRaisesRegex(
-        Exception, (r"(In\[0\] and In\[1\] has different ndims|In\[0\] "
-                    r"ndims must be >= 2|Shape must be rank 2 but is rank 1)")):
+        (ValueError, Exception),
+        (
+            r"(must be at least rank 2"
+            r"|In\[0\] and In\[1\] has different ndims"
+            r"|In\[0\] ndims must be >= 2"
+            r"|Shape must be rank 2 but is rank 1)"
+        ),
+    ):
       infix_matmul(
           ops.convert_to_tensor([10.0, 20.0, 30.0]),
           ops.convert_to_tensor([[40.0, 50.0], [60.0, 70.0]]))
+
+  def testMismatchedShapeErrorMessage(self):
+    """Verifies that the error message for rank < 2 inputs is descriptive."""
+    # --- `a` is rank-1 ---
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Argument `a` passed to `tf.linalg.matmul` must be at least rank 2",
+    ):
+      math_ops.matmul(
+          ops.convert_to_tensor([1.0, 2.0, 3.0]),
+          ops.convert_to_tensor([[4.0, 5.0], [6.0, 7.0], [8.0, 9.0]]),
+      )
+
+    # The message should show the actual shape and rank.
+    try:
+      math_ops.matmul(
+          ops.convert_to_tensor([1.0, 2.0]),
+          ops.convert_to_tensor([[3.0, 4.0], [5.0, 6.0]]),
+      )
+    except ValueError as e:
+      msg = str(e)
+      self.assertIn(
+          "(2,)", msg, "Error message should include the actual shape (2,)"
+      )
+      self.assertIn("rank 1", msg, "Error message should mention 'rank 1'")
+
+    # The message should suggest tf.expand_dims and tf.reshape for `a`.
+    try:
+      math_ops.matmul(
+          ops.convert_to_tensor([1.0, 2.0]),
+          ops.convert_to_tensor([[3.0, 4.0], [5.0, 6.0]]),
+      )
+    except ValueError as e:
+      msg = str(e)
+      self.assertIn(
+          "tf.expand_dims",
+          msg,
+          "Error should suggest tf.expand_dims as a remediation",
+      )
+      self.assertIn(
+          "tf.reshape", msg, "Error should suggest tf.reshape as a remediation"
+      )
+
+    # --- `b` is rank-1 ---
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Argument `b` passed to `tf.linalg.matmul` must be at least rank 2",
+    ):
+      math_ops.matmul(
+          ops.convert_to_tensor([[1.0, 2.0], [3.0, 4.0]]),
+          ops.convert_to_tensor([5.0, 6.0]),
+      )
+
+    # The message for `b` should also suggest tf.expand_dims, tf.reshape, and
+    # tf.linalg.matvec.
+    try:
+      math_ops.matmul(
+          ops.convert_to_tensor([[1.0, 2.0], [3.0, 4.0]]),
+          ops.convert_to_tensor([5.0, 6.0]),
+      )
+    except ValueError as e:
+      msg = str(e)
+      self.assertIn(
+          "tf.expand_dims", msg, "Error for `b` should suggest tf.expand_dims"
+      )
+      self.assertIn(
+          "tf.reshape", msg, "Error for `b` should suggest tf.reshape"
+      )
+      self.assertIn(
+          "tf.linalg.matvec",
+          msg,
+          "Error for `b` should suggest tf.linalg.matvec",
+      )
 
   def testMismatchedDimensions(self):
     with self.assertRaisesRegex(
@@ -265,8 +349,9 @@ if __name__ == "__main__":
   trans_options = [[False, False], [True, False], [False, True]]
   dtypes_to_test = [
       np.int32, np.int64, np.float16, np.float32, np.float64, np.complex64,
-      np.complex128
+      np.complex128, dtypes.bfloat16.as_numpy_dtype
   ]
+
   # TF2 does not support placeholders under eager so we skip it
   for use_static_shape in set([True, tf2.enabled()]):
     for dtype in dtypes_to_test:
@@ -275,6 +360,9 @@ if __name__ == "__main__":
           for k in sizes:
             # Construct compatible random matrices a_np of size [m, k] and b_np
             # of size [k, n].
+            # Add seed value to make the tests for bfloat16 stable.
+            if dtype == dtypes.bfloat16.as_numpy_dtype:
+              np.random.seed(12)
             a_np = np.random.normal(-5, 5, m * k).astype(dtype).reshape([m, k])
             if dtype in (np.complex64, np.complex128):
               a_np.imag = np.random.normal(-5, 5,

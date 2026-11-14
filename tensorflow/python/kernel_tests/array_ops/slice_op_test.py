@@ -24,6 +24,7 @@ from tensorflow.python.framework import errors_impl
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import gradients_impl
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
@@ -145,6 +146,7 @@ class SliceTest(test.TestCase):
         slice_val = self.evaluate(slice_t)
         self.assertAllEqual(slice_val, inp[lo:hi])
 
+  @test_util.run_without_tensor_float_32("Use FP32 in conv3d.")
   def test3Dimension(self):
     with self.cached_session():
       input_shape = [8, 16, 16, 16, 8]
@@ -180,7 +182,8 @@ class SliceTest(test.TestCase):
     input_val = 0
     # Test with constant input; shape inference fails.
     with self.assertRaisesWithPredicateMatch(
-        (ValueError, errors_impl.InvalidArgumentError), "out of range"):
+        (ValueError, errors_impl.InvalidArgumentError),
+        "Attempting to slice scalar input."):
       constant_op.constant(input_val)[:].get_shape()
 
     # Test evaluating with non-constant input; kernel execution fails.
@@ -208,6 +211,54 @@ class SliceTest(test.TestCase):
     with self.assertRaisesWithPredicateMatch(
         TypeError, "must be integers or slices, not tuple"):
       self.evaluate(func(input_val))
+
+  @test_util.run_in_graph_and_eager_modes
+  @test_util.disable_xla(
+      "XLA shape inference rejects the reshape to an INT64_MAX dimension, so "
+      "the test cannot reach the Slice kernel under XLA"
+  )
+  def testBeginSizeOverflowRaises(self):
+    # Regression test for GitHub issue 126125. `begin + size` was validated
+    # with signed int64 addition, so for a large first dimension the sum could
+    # wrap negative, pass the upper-bound check, and reach a fatal
+    # `Tensor::Slice` invariant. It must raise instead.
+    i64_max = (1 << 63) - 1
+    value = array_ops.reshape(
+        constant_op.constant([], dtype=dtypes.float32),
+        constant_op.constant([i64_max, 0], dtype=dtypes.int64),
+    )
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError, "Expected size"
+    ):
+      self.evaluate(
+          gen_array_ops.Slice(
+              input=value,
+              begin=constant_op.constant([i64_max, 0], dtype=dtypes.int64),
+              size=constant_op.constant([i64_max, 0], dtype=dtypes.int64),
+          )
+      )
+
+  def testOutOfBoundsSizeWithConstantInput(self):
+    # An out-of-bounds size is rejected by the Slice kernel in eager execution,
+    # and must be rejected the same way inside a tf.function. Grappler folded a
+    # Slice over a constant into a Const whose value was silently clamped to
+    # the available extent, so the traced version returned a truncated tensor
+    # instead of raising.
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError, r"Expected size\[0\] in \[0, 3\]"
+    ):
+      self.evaluate(
+          array_ops.slice(constant_op.constant([0, 1, 2, 3]), [1], [4])
+      )
+
+    @def_function.function
+    def func():
+      return array_ops.slice(constant_op.constant([0, 1, 2, 3]), [1], [4])
+
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError, r"Expected size\[0\] in \[0, 3\]"
+    ):
+      self.evaluate(func())
 
   def _testSliceMatrixDim0(self, x, begin, size):
     tf_ans = self.evaluate(array_ops.slice(x, [begin, 0], [size, x.shape[1]]))
@@ -248,6 +299,9 @@ class SliceTest(test.TestCase):
           np.float64,
           np.complex64,
           np.complex128,
+          dtypes.bfloat16.as_numpy_dtype,
+          dtypes.float8_e5m2.as_numpy_dtype,
+          dtypes.float8_e4m3fn.as_numpy_dtype,
       ]:
         inp = np.random.rand(4, 4).astype(dtype)
         a = constant_op.constant(
@@ -338,7 +392,7 @@ class SliceTest(test.TestCase):
     slices = []
     for i in range(len(input_shape)):
       slices.append(slice(slice_begin[i], slice_begin[i] + slice_size[i]))
-    np_ans[slices] = grads
+    np_ans[tuple(slices)] = grads
 
     self.assertAllClose(np_ans, result)
 
@@ -363,7 +417,7 @@ class SliceTest(test.TestCase):
     slices = []
     for i in range(len(input_shape)):
       slices.append(slice(slice_begin[i], slice_begin[i] + slice_size[i]))
-    np_ans[slices] = grads
+    np_ans[tuple(slices)] = grads
 
     self.assertAllClose(np_ans, result)
 
@@ -460,7 +514,7 @@ class SliceTest(test.TestCase):
       # unintended behavior is prevented.
       c = constant_op.constant(5.0)
       with self.assertRaisesRegex(errors_impl.OperatorNotAllowedInGraphError,
-                                  "iterating over `tf.Tensor`"):
+                                  "Iterating over a symbolic `tf.Tensor`"):
         for _ in c:
           pass
 

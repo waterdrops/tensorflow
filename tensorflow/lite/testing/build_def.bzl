@@ -1,3 +1,18 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 """Build rule definitions for TFLite zip tests."""
 
 load(
@@ -16,9 +31,13 @@ def generated_test_models():
         "add",
         "add_n",
         "arg_min_max",
+        "atan2",
         "avg_pool",
         "avg_pool3d",
         "batch_to_space_nd",
+        "batchmatmul",
+        "bitcast",
+        "bitwise_xor",
         "broadcast_args",
         "broadcast_gradient_args",
         "broadcast_to",
@@ -45,7 +64,8 @@ def generated_test_models():
         "depth_to_space",
         "depthwiseconv",
         "div",
-        "dynamic_rnn",
+        # copybara:uncomment(b/275574740) "dynamic_rnn",
+        "dynamic_update_slice",
         "einsum",
         "elu",
         "embedding_lookup",
@@ -59,10 +79,12 @@ def generated_test_models():
         "floor_div",
         "floor_mod",
         "fully_connected",
+        "fully_connected_4bit_hybrid",
         "fused_batch_norm",
         "gather",
         "gather_nd",
         "gather_with_constant",
+        "gelu",
         "global_batch_norm",
         "greater",
         "greater_equal",
@@ -85,7 +107,8 @@ def generated_test_models():
         "logical_and",
         "logical_or",
         "logical_xor",
-        "lstm",
+        # copybara:uncomment(b/275574740) "lstm",
+        "matrix_band_part",
         "matrix_diag",
         "matrix_set_diag",
         "max_pool",
@@ -96,6 +119,7 @@ def generated_test_models():
         "minimum",
         "mirror_pad",
         "mul",
+        "multinomial",
         "nearest_upsample",
         "neg",
         "not_equal",
@@ -129,6 +153,7 @@ def generated_test_models():
         "reverse_v2",
         "rfft",
         "rfft2d",
+        "right_shift",
         "roll",
         "roll_with_constant",
         "round",
@@ -138,10 +163,13 @@ def generated_test_models():
         "shape",
         "shape_to_strided_slice",
         "sigmoid",
+        "sigmoid_grad",
+        "sign",
         "sin",
         "slice",
         "softmax",
         "softplus",
+        "softsign",
         "space_to_batch_nd",
         "space_to_depth",
         "sparse_to_dense",
@@ -152,7 +180,7 @@ def generated_test_models():
         "squared_difference",
         "squeeze",
         "static_hashtable",
-        "static_rnn_with_control_flow_v2",
+        # copybara:uncomment(b/275574740) "static_rnn_with_control_flow_v2",
         "stft",
         "strided_slice",
         "strided_slice_1d_exhaustive",
@@ -172,10 +200,14 @@ def generated_test_models():
         "topk",
         "transpose",
         "transpose_conv",
-        "unfused_gru",
+        # copybara:uncomment(b/275574740) "unfused_gru",
         "unique",
         "unpack",
         "unroll_batch_matmul",
+        "unsorted_segment_max",
+        "unsorted_segment_min",
+        "unsorted_segment_prod",
+        "unsorted_segment_sum",
         "where",
         "where_v2",
         "while",
@@ -189,12 +221,6 @@ def mlir_generated_test_denylisted_models():
         # changing on 3/3, this will only be disabled temporarily.
         "unidirectional_sequence_lstm",
         "unidirectional_sequence_rnn",
-    ]
-
-# Test cases which only work internally now.
-def no_oss_generated_test_models():
-    return [
-        "sparse_to_dense",
     ]
 
 # List of models that fail generated tests for the conversion mode.
@@ -214,6 +240,7 @@ def generated_test_models_failing(conversion_mode, delegate):
             "conv3d_transpose",
             "depthwiseconv",
             "dynamic_rnn",
+            "einsum",
             "expand_dims",
             "eye",
             "fill",
@@ -223,8 +250,10 @@ def generated_test_models_failing(conversion_mode, delegate):
             "gather_nd",
             "global_batch_norm",
             "leaky_relu",
+            "matrix_band_part",
             "mean",
             "mirror_pad",
+            "multinomial",
             "one_hot",
             "pad",
             "padv2",
@@ -261,6 +290,10 @@ def generated_test_models_failing(conversion_mode, delegate):
             "topk",
             "transpose",
             "unique",
+            "unsorted_segment_max",
+            "unsorted_segment_min",
+            "unsorted_segment_prod",
+            "unsorted_segment_sum",
             "where",
             "where_v2",
             "while",
@@ -294,7 +327,7 @@ def max_number_of_test_models_in_merged_zip():
     Returns:
       Maximum number of merged test models in a zip file.
     """
-    return 15
+    return 5
 
 def number_of_merged_zip_file(conversion_mode, delegate):
     """Returns the number of merged zip file targets.
@@ -330,6 +363,10 @@ def merged_test_models():
                 # Merged test rules are only for running on the real device environment.
                 if "notap" not in tags:
                     tags.append("notap")
+
+                # Only execute merged tests on real device.
+                if "no_oss" not in tags:
+                    tags.append("no_oss")
                 args = common_test_args_for_generated_models(conversion_mode, False)
                 n = number_of_merged_zip_file(conversion_mode, delegate)
                 for i in range(n):
@@ -409,9 +446,7 @@ def mlir_generated_test_models():
 
 def generated_test_conversion_modes():
     """Returns a list of conversion modes."""
-
-    # TODO(b/146025965): Remove reference to toco.
-    return ["toco-flex", "forward-compat", "", "mlir-quant"]
+    return ["with-flex", "forward-compat", "", "mlir-quant"]
 
 def generated_test_delegates():
     """Returns a list of delegates."""
@@ -431,7 +466,6 @@ def generated_test_models_all():
             (conversion mode, delegate to use, name of test, test tags, test args).
     """
     conversion_modes = generated_test_conversion_modes()
-    no_oss_tests = no_oss_generated_test_models()
     options = []
     for conversion_mode in conversion_modes:
         for delegate in generated_test_delegates():
@@ -439,10 +473,6 @@ def generated_test_models_all():
             for test in mlir_generated_test_models():
                 tags = []
                 args = []
-
-                # TODO(b/187992093): Exclude tests that are failing in OSS for now.
-                if test in no_oss_tests:
-                    tags.append("no_oss")
 
                 # Forward-compat coverage testing is largely redundant, and
                 # contributes to coverage test bloat.
@@ -472,7 +502,7 @@ def common_test_args_for_generated_models(conversion_mode, failing):
 
     # Flex conversion shouldn't suffer from the same conversion bugs
     # listed for the default TFLite kernel backend.
-    if conversion_mode == "toco-flex":
+    if conversion_mode == "with-flex":
         args.append("--ignore_known_bugs=false")
 
     return args
@@ -525,9 +555,8 @@ def gen_zip_test(
         flags += " --make_forward_compat_test"
     elif conversion_mode == "mlir-quant":
         flags += " --mlir_quantizer"
-        # TODO(b/146025965): Remove reference to toco.
 
-    elif conversion_mode == "toco-flex":
+    elif conversion_mode == "with-flex":
         flags += " --ignore_converter_errors --run_with_flex"
     if test_name.startswith(merged_test_model_name() + "_"):
         flags += flags_for_merged_test_models(test_name, conversion_mode, delegate)
@@ -562,12 +591,14 @@ def gen_zipped_test_file(name, file, flags = ""):
     """
     native.genrule(
         name = file + ".files",
-        cmd = (("$(locations :generate_examples) " +
-                " --zip_to_output {0} {1} $(@D)").format(file, flags)),
+        cmd = (("TF_FLAG_SAVED_MODEL_FINGERPRINTING=0 " +
+                "$(location //tensorflow/lite/testing:generate_examples) " +
+                "--enable_tensorflow_metrics_export=false " +
+                "--zip_to_output {0} {1} $(@D)").format(file, flags)),
         outs = [file],
         # `exec_tools` is required for PY3 compatibility in place of `tools`.
-        exec_tools = [
-            ":generate_examples",
+        tools = [
+            "//tensorflow/lite/testing:generate_examples",
         ],
     )
 

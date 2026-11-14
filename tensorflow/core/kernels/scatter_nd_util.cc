@@ -19,9 +19,9 @@ limitations under the License.
 
 namespace tensorflow {
 
-Status ValidateScatterNdUpdateShape(const TensorShape& params_shape,
-                                    const TensorShape& indices_shape,
-                                    const TensorShape& updates_shape) {
+absl::Status ValidateScatterNdUpdateShape(const TensorShape& params_shape,
+                                          const TensorShape& indices_shape,
+                                          const TensorShape& updates_shape) {
   const int64_t slice_dim =
       (indices_shape.dims() > 1)
           ? indices_shape.dim_size(indices_shape.dims() - 1)
@@ -30,11 +30,10 @@ Status ValidateScatterNdUpdateShape(const TensorShape& params_shape,
       (indices_shape.dims() > 1) ? indices_shape.dims() - 1 : 1;
 
   auto shape_err_prefix = [&]() {
-    return errors::InvalidArgument(
-        "Dimensions [0,", batch_dim,
-        ") of indices[shape=", indices_shape.DebugString(),
-        "] must match dimensions [0,", batch_dim,
-        ") of updates[shape=", updates_shape.DebugString(), "]");
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Dimensions [0,", batch_dim, ") of indices[shape=",
+        indices_shape.DebugString(), "] must match dimensions [0,", batch_dim,
+        ") of updates[shape=", updates_shape.DebugString(), "]"));
   };
   auto shape_err_suffix = [&]() {
     return errors::InvalidArgument(
@@ -61,7 +60,7 @@ Status ValidateScatterNdUpdateShape(const TensorShape& params_shape,
       return shape_err_suffix();
     }
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace tensorflow

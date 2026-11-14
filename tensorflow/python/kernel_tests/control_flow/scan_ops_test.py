@@ -14,6 +14,7 @@
 # ==============================================================================
 """Functional tests for scan ops."""
 
+from absl.testing import parameterized
 import numpy as np
 
 from tensorflow.python.framework import constant_op
@@ -34,7 +35,7 @@ def numpy_reverse(x, axis):
   ix = [
       slice(None, None, -1) if i == axis else slice(None) for i in range(length)
   ]
-  return x[ix]
+  return x[tuple(ix)]
 
 
 def handle_options(func, x, axis, exclusive, reverse):
@@ -52,12 +53,12 @@ def handle_options(func, x, axis, exclusive, reverse):
         slice(0, -1) if i == axis else slice(None) for i in range(length)
     ]
     if func == np.cumsum:
-      init = np.zeros_like(x[ix_head])
+      init = np.zeros_like(x[tuple(ix_head)])
     elif func == np.cumprod:
-      init = np.ones_like(x[ix_head])
+      init = np.ones_like(x[tuple(ix_head)])
     else:
       raise ValueError("Unknown scan function.")
-    x = np.concatenate([init, func(x[ix_init], axis)], axis=axis)
+    x = np.concatenate([init, func(x[tuple(ix_init)], axis)], axis=axis)
   else:
     x = func(x, axis=axis)
 
@@ -69,8 +70,14 @@ def handle_options(func, x, axis, exclusive, reverse):
 class CumsumTest(test.TestCase):
 
   valid_dtypes = [
-      np.int32, np.int64, np.float16, np.float32, np.float64, np.complex64,
-      np.complex128
+      np.int32,
+      np.int64,
+      np.float16,
+      np.float32,
+      np.float64,
+      np.complex64,
+      np.complex128,
+      dtypes.bfloat16.as_numpy_dtype,
   ]
 
   def _compare(self, x, axis, exclusive, reverse):
@@ -103,7 +110,12 @@ class CumsumTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testNaN(self):
-    for dtype in (np.float16, np.float32, np.float64):
+    for dtype in (
+        np.float16,
+        np.float32,
+        np.float64,
+        dtypes.bfloat16.as_numpy_dtype,
+    ):
       for nan_idx in range(0, 5):
         x = np.arange(1, 6).reshape([5]).astype(dtype)
         x[nan_idx] = np.nan
@@ -142,6 +154,13 @@ class CumsumTest(test.TestCase):
   @test_util.disable_xla("b/123860949")  # The computation is constant folded
   def testLarge(self):
     for dtype in self.valid_dtypes:
+      if np.__version__ >= np.lib.NumpyVersion("2.0.0") and dtype == np.float16:
+        continue
+      if dtype == dtypes.bfloat16.as_numpy_dtype:
+        # https://github.com/numpy/numpy/issues/27709, which might be fixed
+        # in some numpy version after 2.1.3.
+        continue
+
       x = np.ones([1000000], dtype=dtype) / 1024
       self._compareAll(x, 0)
 
@@ -202,8 +221,14 @@ class CumsumTest(test.TestCase):
 class CumprodTest(test.TestCase):
 
   valid_dtypes = [
-      np.int32, np.int64, np.float16, np.float32, np.float64, np.complex64,
-      np.complex128
+      np.int32,
+      np.int64,
+      np.float16,
+      np.float32,
+      np.float64,
+      np.complex64,
+      np.complex128,
+      dtypes.bfloat16.as_numpy_dtype,
   ]
 
   def _compare(self, x, axis, exclusive, reverse):
@@ -211,7 +236,10 @@ class CumprodTest(test.TestCase):
     with self.cached_session():
       tf_out = math_ops.cumprod(x, axis, exclusive, reverse).eval()
 
-    self.assertAllClose(np_out, tf_out)
+    atol = rtol = 1e-6
+    if x.dtype == dtypes.bfloat16.as_numpy_dtype:
+      atol = rtol = 1e-2
+    self.assertAllClose(np_out, tf_out, atol=atol, rtol=rtol)
 
   def _compareAll(self, x, axis):
     for exclusive in [True, False]:
@@ -323,6 +351,87 @@ class CumprodTest(test.TestCase):
       for exclusive in [True, False]:
         for reverse in [True, False]:
           self._compareGradient([2, 4], axis, exclusive, reverse)
+
+
+@test_util.run_all_in_graph_and_eager_modes
+class LowPrecisionScanAccumulationTest(test.TestCase, parameterized.TestCase):
+  """Module-level test covering cumsum, cumprod, and cumulative_logsumexp.
+
+  bfloat16 and float16 keep only ~8 / ~10 mantissa bits, so accumulating a long
+  sequence directly in the 16-bit type rounds the running total at every step
+  and drifts far from the exact result. The CPU kernel now accumulates in
+  float32 and casts the result back, so on CPU the output must equal the
+  float32 accumulation reference for every axis / flag combination. See #115731.
+
+  The equality only holds on CPU. The float32 upcast lives in the CPU branch of
+  ScanOp::Compute; the GPU kernel still accumulates in the 16-bit type (with a
+  hierarchical CUB block scan), so it is left untouched and produces a different
+  rounding. Pin the device to CPU so this assertion measures the code path under
+  test on every platform, including the GPU test target.
+  """
+
+  @parameterized.parameters(
+      (dtypes.bfloat16,),
+      (dtypes.float16,),
+  )
+  def testLowPrecisionAccuracyVsExact(self, dtype):
+    # Regression for #115731: on CPU the bfloat16/float16 running total used to
+    # be accumulated in the 16-bit type and drifted far from the exact result.
+    # It should now be close to a float64 reference. A local `RandomState` is
+    # used rather than `np.random.seed`, which would mutate the global NumPy
+    # PRNG state and can make unrelated tests order-dependent.
+    rng = np.random.RandomState(0)
+    x = rng.randn(10000).astype(np.float64)
+    x_low = constant_op.constant(x, dtype=dtype)
+
+    with test_util.force_cpu():
+      got = self.evaluate(math_ops.cast(math_ops.cumsum(x_low), dtypes.float64))
+    exact = np.cumsum(x)
+    relative_error = np.linalg.norm(got - exact) / np.linalg.norm(exact)
+    self.assertLess(relative_error, 1e-2)
+
+  @parameterized.parameters(*[
+      (op_name, dtype, axis, exclusive, reverse)
+      for op_name in ("cumsum", "cumprod", "cumulative_logsumexp")
+      for dtype in (dtypes.bfloat16, dtypes.float16)
+      for axis in (0, 1, -1)
+      for exclusive in (False, True)
+      for reverse in (False, True)
+  ])
+  def testLowPrecisionAccumulatesInFloat32(
+      self, op_name, dtype, axis, exclusive, reverse
+  ):
+    op = getattr(math_ops, op_name)
+    # A local `RandomState` is used rather than `np.random.seed`, which would
+    # mutate the global NumPy PRNG state and can make unrelated tests
+    # order-dependent.
+    rng = np.random.RandomState(0)
+    x = rng.randn(100, 50).astype(np.float32)
+    if op_name == "cumprod":
+      # Center the input near 1 so the running product stays within a range
+      # where the 16-bit and float32 accumulations actually differ. Raw
+      # standard-normal values collapse to 0 (or overflow) within a few steps,
+      # which would make the comparison vacuous.
+      x = 1.0 + 0.05 * x
+    x_low = constant_op.constant(x, dtype=dtype)
+
+    with test_util.force_cpu():
+      tf_out = op(x_low, axis=axis, exclusive=exclusive, reverse=reverse)
+      self.assertEqual(tf_out.dtype, dtype)
+
+      # Reference: upcast the 16-bit input to float32, run the scan there, and
+      # cast the result back. This is exactly what the CPU kernel performs, so
+      # the two agree bit-for-bit.
+      expected = math_ops.cast(
+          op(
+              math_ops.cast(x_low, dtypes.float32),
+              axis=axis,
+              exclusive=exclusive,
+              reverse=reverse,
+          ),
+          dtype,
+      )
+    self.assertAllEqual(tf_out, expected)
 
 
 if __name__ == "__main__":

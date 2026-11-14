@@ -33,9 +33,8 @@ bazel run tensorflow/examples/speech_commands:train
 This will write out checkpoints to /tmp/speech_commands_train/, and will
 download over 1GB of open source training data, so you'll need enough free space
 and a good internet connection. The default data is a collection of thousands of
-one-second .wav files, each containing one spoken word. This data set is
-collected from https://aiyprojects.withgoogle.com/open_speech_recording, please
-consider contributing to help improve this and other models!
+one-second .wav files, each containing one spoken word. Learn more at 
+https://blog.research.google/2017/08/launching-speech-commands-dataset.html.
 
 As training progresses, it will print out its accuracy metrics, which should
 rise above 90% by the end. Once it's complete, you can run the freeze script to
@@ -112,10 +111,11 @@ def main(_):
   training_steps_list = list(map(int, FLAGS.how_many_training_steps.split(',')))
   learning_rates_list = list(map(float, FLAGS.learning_rate.split(',')))
   if len(training_steps_list) != len(learning_rates_list):
-    raise Exception(
+    raise ValueError(
         '--how_many_training_steps and --learning_rate must be equal length '
-        'lists, but are %d and %d long instead' % (len(training_steps_list),
-                                                   len(learning_rates_list)))
+        'lists, but are %d and %d long instead'
+        % (len(training_steps_list), len(learning_rates_list))
+    )
 
   input_placeholder = tf.compat.v1.placeholder(
       tf.float32, [None, fingerprint_size], name='fingerprint_input')
@@ -172,7 +172,7 @@ def main(_):
           learning_rate_input, .9,
           use_nesterov=True).minimize(cross_entropy_mean)
     else:
-      raise Exception('Invalid Optimizer')
+      raise ValueError('Invalid Optimizer')
   predicted_indices = tf.argmax(input=logits, axis=1)
   correct_prediction = tf.equal(predicted_indices, ground_truth_input)
   confusion_matrix = tf.math.confusion_matrix(labels=ground_truth_input,

@@ -16,6 +16,7 @@
 from absl.testing import parameterized
 import numpy as np
 
+from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import errors_impl
@@ -24,6 +25,7 @@ from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import bincount_ops
 from tensorflow.python.ops import gen_math_ops
+from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import sparse_ops
 from tensorflow.python.ops.ragged import ragged_factory_ops
 from tensorflow.python.ops.ragged import ragged_tensor
@@ -49,6 +51,16 @@ class BincountTest(test_util.TensorFlowTestCase):
           self.evaluate(
               bincount_ops.bincount([], minlength=3, dtype=np.float64)).dtype,
           np.float64)
+      self.assertAllEqual(
+          self.evaluate(
+              bincount_ops.bincount(
+                  constant_op.constant([], shape=[0], dtype=np.int32),
+                  minlength=5,
+                  binary_output=True,
+              )
+          ),
+          [0, 0, 0, 0, 0],
+      )
 
   def test_values(self):
     with self.session():
@@ -105,17 +117,20 @@ class BincountTest(test_util.TensorFlowTestCase):
             np.bincount(arr, weights))
 
   @test_util.run_gpu_only
+  @test_util.disable_xla("Bincount is deterministic with XLA")
   def test_bincount_determinism_error(self):
     arr = np.random.randint(0, 1000, size=1000)
     with test_util.deterministic_ops(), self.assertRaisesRegex(
         errors_impl.UnimplementedError,
-        "Determinism is not yet supported in GPU implementation of Bincount."):
+        "Determinism is not yet supported in GPU implementation of "
+        "(Dense)?Bincount.",
+    ):
       self.evaluate(bincount_ops.bincount(arr, None, axis=None))
     arr = np.random.randint(0, 1000, size=(100, 100))
     with test_util.deterministic_ops(), self.assertRaisesRegex(
         errors_impl.UnimplementedError,
         "Determinism is not yet supported in GPU implementation of "
-        "DenseBincount."):
+        "(Dense)?Bincount."):
       self.evaluate(bincount_ops.bincount(arr, None, axis=-1))
 
   def test_zero_weights(self):
@@ -124,18 +139,29 @@ class BincountTest(test_util.TensorFlowTestCase):
           self.evaluate(bincount_ops.bincount(np.arange(1000), np.zeros(1000))),
           np.zeros(1000))
 
+  @test_util.disable_xla("This is not raised on XLA CPU")
   def test_negative(self):
     # unsorted_segment_sum will only report InvalidArgumentError on CPU
     with self.cached_session(), ops.device("/CPU:0"):
-      with self.assertRaises(errors.InvalidArgumentError):
+      with self.assertRaisesRegex(
+          (ValueError, errors.InvalidArgumentError), "must be non-negative"
+      ):
         self.evaluate(bincount_ops.bincount([1, 2, 3, -1, 6, 8]))
+      with self.assertRaisesRegex(
+          (ValueError, errors.InvalidArgumentError), "must be non-negative"
+      ):
+        self.evaluate(
+            gen_math_ops.dense_bincount(
+                input=[[1, 1, 3], [0, -1, 2]], weights=[], size=4
+            )
+        )
 
   @test_util.run_in_graph_and_eager_modes
   def test_shape_function(self):
     # size must be scalar.
     with self.assertRaisesRegex(
         (ValueError, errors.InvalidArgumentError),
-        "Shape must be rank 0 but is rank 1(?s).*Bincount"):
+        "(?s)Shape must be rank 0 but is rank 1.*Bincount"):
       gen_math_ops.bincount([1, 2, 3, 1, 6, 8], [1], [])
     # size must be positive.
     with self.assertRaisesRegex((ValueError, errors.InvalidArgumentError),
@@ -149,6 +175,31 @@ class BincountTest(test_util.TensorFlowTestCase):
       s = array_ops.placeholder(dtype=dtypes.int32)
       v2 = gen_math_ops.bincount([1, 2, 3, 1, 6, 8], s, [])
       self.assertAllEqual(v2.get_shape().as_list(), [None])
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_invalid_inputs(self):
+    binary_output = True
+    inp = random_ops.random_uniform(
+        shape=[10, 10],
+        minval=-10000,
+        maxval=10000,
+        dtype=dtypes.int32,
+        seed=-2460)
+    size = random_ops.random_uniform(
+        shape=[], minval=-10000, maxval=10000, dtype=dtypes.int32, seed=-10000)
+    weights = random_ops.random_uniform(
+        shape=[],
+        minval=-10000,
+        maxval=10000,
+        dtype=dtypes.float32,
+        seed=-10000)
+    with self.assertRaises(errors.InvalidArgumentError):
+      self.evaluate(
+          gen_math_ops.dense_bincount(
+              input=inp,
+              size=size,
+              weights=weights,
+              binary_output=binary_output))
 
 
 class BincountOpTest(test_util.TensorFlowTestCase, parameterized.TestCase):
@@ -222,6 +273,154 @@ class BincountOpTest(test_util.TensorFlowTestCase, parameterized.TestCase):
               gen_math_ops.dense_bincount(
                   input=inp, weights=np_weight, size=size, binary_output=True)))
 
+  @test_util.run_gpu_only
+  def test_bincount_all_binary_with_negative_input_on_gpu(self):
+    # Regression test for https://github.com/tensorflow/tensorflow/issues/103995
+    # BincountReduceKernel only checked `bin < num_bins`, so a negative
+    # input value indexed before the start of the output buffer on GPU
+    # (an out-of-bounds write) instead of being skipped like the CPU
+    # kernel does.
+    size = 7
+    inp = np.array(
+        [-1737321568, 32584, 7, 4, 3, 7, 7, 2, 5, 4, 1, 7, 5, 1], dtype=np.int32
+    )
+    expected_out = np.zeros((size,))
+    for v in inp:
+      if 0 <= v < size:
+        expected_out[v] = 1
+    with ops.device("/GPU:0"):
+      out = self.evaluate(
+          gen_math_ops.dense_bincount(
+              input=inp, weights=[], size=size, binary_output=True
+          )
+      )
+    self.assertAllEqual(expected_out, out)
+
+  @test_util.run_gpu_only
+  @test_util.run_in_graph_and_eager_modes
+  @test_util.disable_xla("XLA does not use DeviceHistogram")
+  def test_size_too_large_for_gpu_histogram(self):
+    max_gpu_bins = 2**31 - 1 - 1024
+    with test_util.force_gpu():
+      for bad_size in (max_gpu_bins + 1, 2**31 - 2):
+        size_i32 = array_ops.placeholder_with_default(
+            np.int32(bad_size), shape=[]
+        )
+        with self.assertRaisesRegex(
+            errors.InvalidArgumentError, "must be at most"
+        ):
+          self.evaluate(
+              gen_math_ops.dense_bincount(
+                  input=[0, 1, 1],
+                  weights=[],
+                  size=size_i32,
+                  binary_output=False,
+              )
+          )
+        with self.assertRaisesRegex(
+            errors.InvalidArgumentError, "must be at most"
+        ):
+          self.evaluate(
+              gen_math_ops.bincount(arr=[0, 1, 1], size=size_i32, weights=[])
+          )
+
+      for bad_size_i64 in (max_gpu_bins + 1, 2**31):
+        size_i64 = array_ops.placeholder_with_default(
+            np.int64(bad_size_i64), shape=[]
+        )
+        with self.assertRaisesRegex(
+            errors.InvalidArgumentError, "must be at most"
+        ):
+          self.evaluate(
+              gen_math_ops.dense_bincount(
+                  input=np.array([0, 1, 1], dtype=np.int64),
+                  weights=[],
+                  size=size_i64,
+                  binary_output=False,
+              )
+          )
+
+      overflow_2d_size = array_ops.placeholder_with_default(
+          np.int64(1 << 62), shape=[]
+      )
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, "Encountered overflow when multiplying"
+      ):
+        self.evaluate(
+            gen_math_ops.dense_bincount(
+                input=np.zeros((2, 1), dtype=np.int64),
+                weights=[],
+                size=overflow_2d_size,
+                binary_output=False,
+            )
+        )
+
+      empty_high_rows = array_ops.zeros(
+          constant_op.constant([2**31, 0], dtype=dtypes.int64),
+          dtype=dtypes.int32,
+      )
+      zero_size = array_ops.placeholder_with_default(np.int32(0), shape=[])
+      out = self.evaluate(
+          gen_math_ops.dense_bincount(
+              input=empty_high_rows,
+              weights=[],
+              size=zero_size,
+              binary_output=False,
+          )
+      )
+      self.assertEqual(out.shape, (2**31, 0))
+
+  def _test_bincount_col_binary_with_negative_input(
+      self, num_rows, num_cols, size, dtype
+  ):
+    # Regression test for the same out-of-bounds write as above, but in
+    # BincountColReduceKernel / BincountColReduceSharedKernel, which had
+    # the identical missing lower-bound check.
+    np.random.seed(42)
+    inp = np.random.randint(0, size, (num_rows, num_cols), dtype=dtype)
+    inp[0, 0] = -1737321568
+    inp[num_rows - 1, num_cols - 1] = -1
+    expected_out = np.zeros((num_rows, size))
+    for row in range(num_rows):
+      for v in inp[row]:
+        if 0 <= v < size:
+          expected_out[row, v] = 1
+    with ops.device("/GPU:0"):
+      out = self.evaluate(
+          gen_math_ops.dense_bincount(
+              input=inp, weights=[], size=size, binary_output=True
+          )
+      )
+    self.assertAllEqual(expected_out, out)
+
+  @parameterized.parameters([
+      {
+          "dtype": np.int32,
+      },
+      {
+          "dtype": np.int64,
+      },
+  ])
+  @test_util.run_gpu_only
+  def test_col_reduce_shared_memory_with_negative_input(self, dtype):
+    # num_rows * size small enough to select BincountColReduceSharedKernel,
+    # matching test_col_reduce_shared_memory below.
+    self._test_bincount_col_binary_with_negative_input(128, 27, 10, dtype)
+
+  @parameterized.parameters([
+      {
+          "dtype": np.int32,
+      },
+      {
+          "dtype": np.int64,
+      },
+  ])
+  @test_util.run_gpu_only
+  def test_col_reduce_global_memory_with_negative_input(self, dtype):
+    # num_rows * size large enough to select BincountColReduceKernel,
+    # matching test_col_reduce_global_memory below.
+    self._test_bincount_col_binary_with_negative_input(128, 27, 1024, dtype)
+
   def _test_bincount_col_count(self, num_rows, num_cols, size, dtype):
     np.random.seed(42)
     inp = np.random.randint(0, size, (num_rows, num_cols), dtype=dtype)
@@ -263,11 +462,12 @@ class BincountOpTest(test_util.TensorFlowTestCase, parameterized.TestCase):
         ],
                        axis=0), (num_rows, size))
     with test_util.use_gpu():
-      self.assertAllEqual(
-          np_out,
-          self.evaluate(
-              gen_math_ops.dense_bincount(
-                  input=inp, weights=np_weight, size=size)))
+      evaluated = self.evaluate(
+          gen_math_ops.dense_bincount(input=inp, weights=np_weight, size=size))
+      if np_out.dtype in (np.float32, np.float64):
+        self.assertAllClose(np_out, evaluated)
+      else:
+        self.assertAllEqual(np_out, evaluated)
 
   def test_col_reduce_basic(self):
     with test_util.use_gpu():
@@ -344,21 +544,32 @@ class BincountOpTest(test_util.TensorFlowTestCase, parameterized.TestCase):
             gen_math_ops.dense_bincount(
                 input=[[[1, 2, 3], [0, 3, 2]]], weights=[], size=10))
 
+  @test_util.run_in_graph_and_eager_modes
+  def test_size_is_not_scalar(self):  # b/206619828
+    with self.assertRaisesRegex((ValueError, errors.InvalidArgumentError),
+                                "Shape must be rank 0 but is rank 1"):
+      self.evaluate(
+          gen_math_ops.dense_bincount(
+              input=[0], size=[1, 1], weights=[3], binary_output=False))
+
 
 class SparseBincountOpTest(test_util.TensorFlowTestCase,
                            parameterized.TestCase):
 
-  @parameterized.parameters([{
-      "dtype": np.int32,
-  }, {
-      "dtype": np.int64,
-  }])
+  @parameterized.parameters([
+      {
+          "dtype": np.int32,
+      },
+      {
+          "dtype": np.int64,
+      },
+  ])
   def test_sparse_bincount_all_count(self, dtype):
     np.random.seed(42)
-    num_rows = 128
+    num_rows = 4096
     size = 1000
-    n_elems = 4096
-    inp_indices = np.random.randint(0, num_rows, (n_elems,))
+    n_elems = 128
+    inp_indices = np.random.randint(0, num_rows, (n_elems, 1))
     inp_vals = np.random.randint(0, size, (n_elems,), dtype=dtype)
 
     np_out = np.bincount(inp_vals, minlength=size)
@@ -372,17 +583,20 @@ class SparseBincountOpTest(test_util.TensorFlowTestCase,
                 size=size,
                 weights=[])))
 
-  @parameterized.parameters([{
-      "dtype": np.int32,
-  }, {
-      "dtype": np.int64,
-  }])
+  @parameterized.parameters([
+      {
+          "dtype": np.int32,
+      },
+      {
+          "dtype": np.int64,
+      },
+  ])
   def test_sparse_bincount_all_count_with_weights(self, dtype):
     np.random.seed(42)
-    num_rows = 128
+    num_rows = 4096
     size = 1000
-    n_elems = 4096
-    inp_indices = np.random.randint(0, num_rows, (n_elems,))
+    n_elems = 128
+    inp_indices = np.random.randint(0, num_rows, (n_elems, 1))
     inp_vals = np.random.randint(0, size, (n_elems,), dtype=dtype)
     inp_weight = np.random.random((n_elems,))
 
@@ -407,7 +621,7 @@ class SparseBincountOpTest(test_util.TensorFlowTestCase,
     num_rows = 128
     size = 10
     n_elems = 4096
-    inp_indices = np.random.randint(0, num_rows, (n_elems,))
+    inp_indices = np.random.randint(0, num_rows, (n_elems, 1))
     inp_vals = np.random.randint(0, size, (n_elems,), dtype=dtype)
 
     np_out = np.ones((size,))
@@ -432,7 +646,7 @@ class SparseBincountOpTest(test_util.TensorFlowTestCase,
     num_rows = 128
     size = 10
     n_elems = 4096
-    inp_indices = np.random.randint(0, num_rows, (n_elems,))
+    inp_indices = np.random.randint(0, num_rows, (n_elems, 1))
     inp_vals = np.random.randint(0, size, (n_elems,), dtype=dtype)
     inp_weight = np.random.random((n_elems,))
 
@@ -510,6 +724,154 @@ class SparseBincountOpTest(test_util.TensorFlowTestCase,
                 size=size,
                 weights=[],
                 binary_output=True)))
+
+  @parameterized.parameters([
+      {
+          "values": [0, 1, 2, 2],
+          "axis": 0,
+          "binary": False,
+          "expect": [1, 1, 2],
+      },
+      {
+          "values": [2, 1, 2, 2],
+          "axis": 0,
+          "binary": False,
+          "expect": [0, 1, 3],
+      },
+      {
+          "values": [0, 1, 2, 2],
+          "axis": 0,
+          "binary": True,
+          "expect": [1, 1, 1],
+      },
+      {
+          "values": [2, 1, 2, 2],
+          "axis": 0,
+          "binary": True,
+          "expect": [0, 1, 1],
+      },
+      {
+          "values": [0, 1, 2, 2],
+          "axis": -1,
+          "binary": False,
+          "expect": [[0, 0, 0], [1, 1, 0], [0, 0, 2], [0, 0, 0]],
+      },
+      {
+          "values": [2, 1, 2, 2],
+          "axis": -1,
+          "binary": False,
+          "expect": [[0, 0, 0], [0, 1, 1], [0, 0, 2], [0, 0, 0]],
+      },
+      {
+          "values": [0, 1, 2, 2],
+          "axis": -1,
+          "binary": True,
+          "expect": [[0, 0, 0], [1, 1, 0], [0, 0, 1], [0, 0, 0]],
+      },
+      {
+          "values": [2, 1, 2, 2],
+          "axis": -1,
+          "binary": True,
+          "expect": [[0, 0, 0], [0, 1, 1], [0, 0, 1], [0, 0, 0]],
+      },
+  ])
+  def test_sparse_bincount_implicit_zeros(
+      self, values, axis, binary, expect
+  ):
+    if axis == -1:
+      indices = [[1, 2], [1, 4], [2, 2], [2, 4]]
+      dense_shape = [4, 5]
+    else:
+      indices = [[7], [9], [12], [14]]
+      dense_shape = [20]
+
+    self.assertAllEqual(
+        expect,
+        self.evaluate(
+            gen_math_ops.sparse_bincount(
+                indices=indices,
+                values=values,
+                dense_shape=dense_shape,
+                size=3,
+                weights=[],
+                binary_output=binary)))
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_size_is_not_scalar(self):  # b/206619828
+    with self.assertRaisesRegex((ValueError, errors.InvalidArgumentError),
+                                "Shape must be rank 0 but is rank 1"):
+      self.evaluate(
+          gen_math_ops.sparse_bincount(
+              indices=[[0], [1]],
+              values=[0, 0],
+              dense_shape=[1, 1],
+              size=[1, 1],
+              weights=[0, 0],
+              binary_output=False))
+
+  def test_sparse_bincount_input_validation(self):
+    np.random.seed(42)
+    num_rows = 128
+    size = 1000
+    n_elems = 4096
+    inp_indices = np.random.randint(0, num_rows, (n_elems, 1))
+    inp_vals = np.random.randint(0, size, (n_elems,))
+
+    # Insert negative index.
+    inp_indices[10, 0] = -2
+
+    with self.assertRaisesRegex((ValueError, errors.InvalidArgumentError),
+                                "out of bounds"):
+      self.evaluate(
+          gen_math_ops.sparse_bincount(
+              indices=inp_indices,
+              values=inp_vals,
+              dense_shape=[num_rows],
+              size=size,
+              weights=[]))
+
+  def test_sparse_bincount_rank0_fails(self):
+    # Regression test for the rank-0 guard in SparseBincountOp::Compute
+    # ("dense_shape must have at least 1 dimension"). Without it the kernel
+    # reads dense_shape(0) on an empty dense_shape. Shape inference may reject
+    # the input first, so both messages are accepted.
+    with self.assertRaisesRegex(
+        (ValueError, errors.InvalidArgumentError),
+        "Input must be less than rank 2|"
+        "dense_shape must have at least 1 dimension",
+    ):
+      self.evaluate(
+          gen_math_ops.sparse_bincount(
+              indices=constant_op.constant(
+                  [], shape=[1, 0], dtype=dtypes.int64
+              ),
+              values=[0],
+              dense_shape=constant_op.constant(
+                  [], shape=[0], dtype=dtypes.int64
+              ),
+              size=10,
+              weights=[],
+          )
+      )
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_sparse_bincount_invalid_weights_length(self):
+    # Regression test: the 2-D SparseBincount path reads `weights(i)` with the
+    # value index `i`, so a `weights` shorter than the values would be read out
+    # of bounds. It must be rejected like the 1-D path and DenseBincount do.
+    with self.assertRaisesRegex(
+        (ValueError, errors.InvalidArgumentError),
+        "must be the same length as `values`",
+    ):
+      self.evaluate(
+          gen_math_ops.sparse_bincount(
+              indices=[[0, 0], [1, 0], [2, 0]],
+              values=[1, 1, 1],
+              dense_shape=[3, 2],
+              size=2,
+              weights=[1.0],
+          )
+      )
 
 
 class RaggedBincountOpTest(test_util.TensorFlowTestCase,
@@ -649,6 +1011,47 @@ class RaggedBincountOpTest(test_util.TensorFlowTestCase,
                 weights=[],
                 size=size,
                 binary_output=True)))
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_size_is_not_scalar(self):  # b/206619828
+    with self.assertRaisesRegex((ValueError, errors.InvalidArgumentError),
+                                "Shape must be rank 0 but is rank 1"):
+      self.evaluate(
+          gen_math_ops.ragged_bincount(
+              splits=[0, 0, 1],
+              values=[1],
+              size=[1, 1],
+              weights=[0, 0, 0],
+              binary_output=False,
+              name=None))
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_splits_empty(self):  # b/238450914
+    with self.assertRaisesRegex((ValueError, errors.InvalidArgumentError),
+                                "Splits must be non-empty"):
+      self.evaluate(
+          gen_math_ops.ragged_bincount(
+              splits=[],  # Invalid splits
+              values=[1],
+              size=1,
+              weights=[1],
+              binary_output=False,
+              name=None))
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_ragged_bincount_invalid_weights_length(self):
+    # Regression test: RaggedBincount reads `weights(idx)` with the value
+    # index `idx`, so a `weights` shorter than the values would be read out of
+    # bounds. It must be rejected like the 1-D path and DenseBincount do.
+    with self.assertRaisesRegex(
+        (ValueError, errors.InvalidArgumentError),
+        "must be the same length as `values`",
+    ):
+      self.evaluate(
+          gen_math_ops.ragged_bincount(
+              splits=[0, 3], values=[1, 1, 1], size=2, weights=[1.0]
+          )
+      )
 
 
 if __name__ == "__main__":

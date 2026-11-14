@@ -18,10 +18,12 @@ Additional tests are included in spacetobatch_op_test.py, where the BatchToSpace
 op is tested in tandem with its reverse SpaceToBatch op.
 """
 
+from absl.testing import parameterized
 import numpy as np
 
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
@@ -44,12 +46,14 @@ class CppOpImpl(object):
     return gen_array_ops.batch_to_space(*args, **kwargs)
 
 
-class BatchToSpaceDepthToSpace(test.TestCase, PythonOpImpl):
+class BatchToSpaceDepthToSpace(test.TestCase, parameterized.TestCase,
+                               PythonOpImpl):
 
   # Verifies that: batch_to_space(x) = transpose(depth_to_space(transpose(x)))
+  @parameterized.parameters(np.float32, dtypes.bfloat16.as_numpy_dtype)
   @test_util.run_deprecated_v1
-  def testDepthToSpaceTranspose(self):
-    x = np.arange(20 * 5 * 8 * 7, dtype=np.float32).reshape([20, 5, 8, 7])
+  def testDepthToSpaceTranspose(self, dtype):
+    x = np.arange(20 * 5 * 8 * 7, dtype=dtype).reshape([20, 5, 8, 7])
     block_size = 2
     for crops_dtype in [dtypes.int64, dtypes.int32]:
       crops = array_ops.zeros((2, 2), dtype=crops_dtype)
@@ -95,7 +99,7 @@ class BatchToSpaceErrorHandlingTest(test.TestCase, PythonOpImpl):
     block_size = 1
     with self.assertRaises(ValueError):
       out_tf = self.batch_to_space(x_np, crops, block_size)
-      out_tf.eval()
+      self.evaluate(out_tf)
 
   @test_util.run_deprecated_v1
   def testBlockSizeLarger(self):
@@ -125,8 +129,9 @@ class BatchToSpaceErrorHandlingTest(test.TestCase, PythonOpImpl):
     self.assertEqual(4, t.get_shape().ndims)
 
 
-class BatchToSpaceErrorHandlingCppTest(BatchToSpaceErrorHandlingTest,
-                                       CppOpImpl):
+class BatchToSpaceErrorHandlingCppTest(
+    CppOpImpl, BatchToSpaceErrorHandlingTest
+):
   pass
 
 
@@ -153,12 +158,16 @@ class BatchToSpaceNDErrorHandlingTest(test.TestCase):
     t = array_ops.batch_to_space_nd(input_placeholder, block_shape_placeholder,
                                     paddings_placeholder)
 
-    with self.assertRaises(ValueError):
-      _ = t.eval({
-          input_placeholder: np.zeros(input_shape, np.float32),
-          block_shape_placeholder: block_shape,
-          paddings_placeholder: paddings
-      })
+    with self.cached_session() as sess:
+      with self.assertRaises((ValueError, errors.InvalidArgumentError)):
+        sess.run(
+            t,
+            feed_dict={
+                input_placeholder: np.zeros(input_shape, np.float32),
+                block_shape_placeholder: block_shape,
+                paddings_placeholder: paddings,
+            },
+        )
 
   def _testShape(self, input_shape, block_shape, paddings, error):
     self._testStaticShape(input_shape, block_shape, paddings, error)

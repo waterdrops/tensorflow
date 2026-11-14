@@ -15,8 +15,10 @@ limitations under the License.
 
 #include "tensorflow/compiler/mlir/tosa/tf_tfl_passes.h"
 
-#include "mlir/Dialect/Affine/Passes.h"  // from @llvm-project
+#include "mlir/Dialect/Affine/Transforms/Passes.h"  // from @llvm-project
 #include "mlir/Dialect/Tosa/Transforms/Passes.h"  // from @llvm-project
+#include "mlir/Pass/PassManager.h"  // from @llvm-project
+#include "mlir/Pass/PassRegistry.h"  // from @llvm-project
 #include "mlir/Transforms/Passes.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/lite/transforms/lift_tflite_flex_ops.h"
 #include "tensorflow/compiler/mlir/lite/transforms/passes.h"
@@ -30,6 +32,9 @@ void createTFTFLtoTOSALegalizationPipeline(
   //----------------------------------------------------------------------------
   // Prepare TFL module for conversion
   //----------------------------------------------------------------------------
+  // For stateful ops
+  pm.addPass(createRetainCallOnceFuncsPass());
+
   // Inline all functions into main and then delete the functions themselves.
   pm.addPass(mlir::createInlinerPass());
 
@@ -40,20 +45,25 @@ void createTFTFLtoTOSALegalizationPipeline(
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
 
-  pm.addPass(mlir::createLoopFusionPass());
-  pm.addPass(mlir::createAffineScalarReplacementPass());
+  pm.addPass(mlir::affine::createLoopFusionPass());
+  pm.addPass(mlir::affine::createAffineScalarReplacementPass());
 
   //----------------------------------------------------------------------------
   // Perform main conversion.
   //----------------------------------------------------------------------------
   pm.addPass(mlir::TFL::CreateLiftTfliteFlexOpsPass());
   pm.addPass(mlir::tosa::createFuseBiasTFPass());
-  pm.addPass(mlir::tosa::createConvertTFLUint8Pass());
+  pm.addPass(mlir::tosa::createConvertTFLUnsignedIntToSignedPass());
+  if (opts.dequantize_tfl_softmax) {
+    pm.addPass(mlir::tosa::createDequantizeTFLSoftmaxPass());
+  }
+  pm.addPass(mlir::tosa::createLegalizeTFLStatefulPass());
   pm.addPass(mlir::tosa::createLegalizeTFTFLPass());
 
   //----------------------------------------------------------------------------
   // Post conversion cleanup.
   //----------------------------------------------------------------------------
+  pm.addPass(mlir::tosa::createLowerComplexTypesPass());
   pm.addPass(mlir::tosa::createTosaInferShapesPass());
   pm.addPass(mlir::tosa::createTosaMakeBroadcastablePass());
   // Inline the call/return basic blocks within TOSA control flow ops.

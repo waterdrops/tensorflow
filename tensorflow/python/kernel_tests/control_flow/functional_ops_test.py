@@ -19,18 +19,17 @@ import numpy as np
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.core.protobuf import config_pb2
 from tensorflow.python.client import session
-from tensorflow.python.data.ops import iterator_ops
 from tensorflow.python.eager import cancellation
 from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function as eager_def_function
 from tensorflow.python.eager import executor
-from tensorflow.python.eager import function as eager_function
 from tensorflow.python.framework import config as framework_config
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import function
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import collective_ops
@@ -39,12 +38,10 @@ from tensorflow.python.ops import gen_functional_ops
 from tensorflow.python.ops import gradients_impl
 from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables
 import tensorflow.python.ops.tensor_array_grad  # pylint: disable=unused-import
 from tensorflow.python.platform import test
-from tensorflow.python.util import compat
 
 
 # pylint: disable=invalid-name
@@ -76,6 +73,26 @@ class FunctionalOpsTest(test.TestCase):
         elems,
         initializer=10)
     self.assertAllEqual(880, self.evaluate(r))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testScalarElemsRejected(self):
+    # These take the number of iterations from elems.shape[0], which gives
+    # IndexError out of tensor_shape for a scalar. map_fn already reports it,
+    # so they should say the same thing.
+    elems = constant_op.constant(5, name="data")
+    vec = constant_op.constant([1, 2], name="vec")
+    for op in (functional_ops.foldl, functional_ops.foldr, functional_ops.scan):
+      with self.assertRaisesRegex(ValueError, "must be 1\\+ dimensional"):
+        op(lambda a, x: a + x, elems)
+      # a scalar anywhere in elems is a problem, not just the first one
+      with self.assertRaisesRegex(ValueError, "must be 1\\+ dimensional"):
+        op(lambda a, x: a + x[0] + x[1], (vec, elems), initializer=0)
+      with self.assertRaisesRegex(
+          ValueError, "elems must contain at least one Tensor"
+      ):
+        op(lambda a, x: a + x, [])
+    with self.assertRaisesRegex(ValueError, "must be 1\\+ dimensional"):
+      functional_ops.foldl(lambda a, x: a + x, elems, initializer=0)
 
   @test_util.run_in_graph_and_eager_modes
   def testFoldl_SingleInputMultiOutput(self):
@@ -593,7 +610,7 @@ class FunctionalOpsTest(test.TestCase):
     def run():
       with ops.device("/cpu:0"):
         return functional_ops.remote_call(
-            args=[constant_op.constant([1.])],
+            args=[constant_op.constant([1.])] + _remote_fn.captured_inputs,
             Tout=[dtypes.float32],
             f=_remote_fn,
             target="/cpu:1")[0]
@@ -858,6 +875,44 @@ class FunctionalOpsTest(test.TestCase):
     for use_gpu in (True, False):
       self._tfSum(use_gpu, False)
 
+  def testForEager(self):
+    with context.eager_mode():
+
+      @eager_def_function.function
+      def body(i, x):
+        step = math_ops.cast(i, dtypes.float32)
+        return x + step * 0.25
+
+      body_fn = body.get_concrete_function(
+          tensor_spec.TensorSpec(shape=(), dtype=dtypes.int32),
+          tensor_spec.TensorSpec(shape=(3,), dtype=dtypes.float32),
+      )
+
+      initial = constant_op.constant([0.5, 1.5, -2.0], dtype=dtypes.float32)
+      start = constant_op.constant(0, dtype=dtypes.int32)
+      limit = constant_op.constant(4, dtype=dtypes.int32)
+      delta = constant_op.constant(1, dtype=dtypes.int32)
+
+      with ops.device("/CPU:0"):
+        cpu_out = gen_functional_ops._for(
+            start=start,
+            limit=limit,
+            delta=delta,
+            input=[initial],
+            body=body_fn,
+        )[0]
+
+      with ops.device(test_util.gpu_device_name()):
+        gpu_out = gen_functional_ops._for(
+            start=start,
+            limit=limit,
+            delta=delta,
+            input=[initial],
+            body=body_fn,
+        )[0]
+      self.assertAllClose([2.0, 3.0, -0.5], cpu_out)
+      self.assertAllClose([2.0, 3.0, -0.5], gpu_out)
+
   def testForWithWhile(self):
     for use_gpu in (True, False):
       self._tfSum(use_gpu, True)
@@ -876,9 +931,9 @@ class FunctionalOpsTest(test.TestCase):
     names = []
     for func in g.as_graph_def().library.function:
       names.append(func.signature.name)
-    self.assertTrue("TestBody" in names)
-    self.assertTrue("TestBody_Cond" in names)
-    self.assertTrue("TestBody_Body" in names)
+    self.assertIn("TestBody", names)
+    self.assertIn("TestBody_Cond", names)
+    self.assertIn("TestBody_Body", names)
 
   @test_util.run_deprecated_v1
   def testForCapturedInputs(self):
@@ -1028,7 +1083,7 @@ class FunctionalOpsTest(test.TestCase):
     def run():
       with ops.device("/cpu:0"):
         return functional_ops.remote_call(
-            args=[constant_op.constant([1.])],
+            args=[constant_op.constant([1.])] + collective_fn.captured_inputs,
             Tout=[dtypes.float32],
             f=collective_fn,
             target="/cpu:1")
@@ -1036,226 +1091,20 @@ class FunctionalOpsTest(test.TestCase):
     self.assertAllEqual(run(), [[1.]])
 
 
-# TODO(akshayka): Replace `function.Defun` with tf.contrib.eager.defun` in the
-# below test cases.
-class PartitionedCallTest(test.TestCase):
-
-  @test_util.run_deprecated_v1
-  def testRemoteDeviceInPartitionedCallOp(self):
-    workers, _ = test_util.create_local_cluster(2, 0)
-
-    worker0_device = "/job:worker/replica:0/task:0/cpu:0"
-    worker1_device = "/job:worker/replica:0/task:1/cpu:0"
-
-    @eager_def_function.function
-    def f(a, b):
-      return a + b
-
-    with session.Session(workers[0].target) as sess:
-      with ops.device(worker0_device):
-        a = variable_scope.get_variable(
-            "a", initializer=constant_op.constant(1.), use_resource=True)
-      with ops.device(worker1_device):
-        b = variable_scope.get_variable(
-            "b", initializer=constant_op.constant(1.), use_resource=True)
-
-      sess.run(variables.global_variables_initializer())
-
-    config = config_pb2.ConfigProto()
-    config.share_cluster_devices_in_session = True
-
-    with session.Session(workers[0].target, config=config) as sess:
-      res = sess.run(f(a, b))
-
-    self.assertEqual(res, 2)
-
-  @test_util.run_deprecated_v1
-  def testBasicSingleDevice(self):
-
-    @function.Defun(*[dtypes.float32] * 2)
-    def Body(x, y):
-      with ops.device("/cpu:0"):
-        a = x + x
-        b = y + y
-        return a + b
-
-    output, = self.evaluate(
-        functional_ops.partitioned_call(
-            args=[constant_op.constant(1.),
-                  constant_op.constant(2.)], f=Body))
-    self.assertEqual(output, 6.)
-
-  @test_util.run_deprecated_v1
-  def testBasicMultiDevice(self):
-    config = config_pb2.ConfigProto(device_count={"CPU": 3})
-
-    @function.Defun(*[dtypes.float32] * 2)
-    def Body(x, y):
-      # if x = 1, y = 2, ...
-      with ops.device("/cpu:0"):
-        # a:= 1 + 1 = 2
-        a = x + x
-      with ops.device("/cpu:1"):
-        # b:= 2 + 2 = 4
-        b = a + y
-      with ops.device("/cpu:2"):
-        # c:= 2 + 4 = 6
-        c = a + b
-      # a + b + c = 2 + 4 + 6 = 12
-      return a + b + c
-
-    with self.test_session(config=config):
-      output, = functional_ops.partitioned_call(
-          args=[constant_op.constant(1.),
-                constant_op.constant(2.)], f=Body)
-      self.assertEqual(self.evaluate(output), 12.)
-
-  @test_util.run_deprecated_v1
-  def testBasicMultiDeviceGPU(self):
-    if not test_util.is_gpu_available():
-      return
-
-    @function.Defun(*[dtypes.float32] * 2)
-    def Body(x, y):
-      with ops.device("/gpu:0"):
-        a = x + x
-        b = y + y
-      with ops.device("/cpu:0"):
-        c = a + b
-        return c
-
-    output, = self.evaluate(
-        functional_ops.partitioned_call(
-            args=[constant_op.constant(1.),
-                  constant_op.constant(2.)], f=Body))
-    self.assertEqual(output, 6.)
-
-  @test_util.run_deprecated_v1
-  def testBasicNoDeviceAnnotations(self):
-
-    @function.Defun(*[dtypes.float32] * 2)
-    def Body(x, y):
-      a = x + x
-      b = y + y
-      return a + b
-
-    output, = self.evaluate(
-        functional_ops.partitioned_call(
-            args=[constant_op.constant(1.),
-                  constant_op.constant(2.)], f=Body))
-    self.assertEqual(output, 6.)
-
-  @test_util.run_deprecated_v1
-  def testShardsRunOnRequestedDevices(self):
-    config = config_pb2.ConfigProto(device_count={"CPU": 4})
-
-    @function.Defun()
-    def Body():
-      # Serialize DT_RESOURCE handles as DT_STRINGs, which encode the device on
-      # which the resource was created, so that we can verify that ops were
-      # actually run on the requested devices.
-      #
-      # TODO(akshayka): Provide a cleaner, more idiomatic API for obtaining the
-      # name of the device on which a resource lives / for determining the
-      # device on which an op ran.
-      with ops.device("/cpu:0"):
-        s1 = iterator_ops.Iterator.from_structure(
-            (dtypes.float32,)).string_handle()
-      with ops.device("/cpu:1"):
-        s2 = iterator_ops.Iterator.from_structure(
-            (dtypes.float32,)).string_handle()
-      with ops.device("/cpu:2"):
-        s3 = iterator_ops.Iterator.from_structure(
-            (dtypes.float32,)).string_handle()
-      return s1, s2, s3
-
-    with self.test_session(config=config, use_gpu=True) as sess:
-      outputs = sess.run(functional_ops.partitioned_call(args=[], f=Body))
-    self.assertIn(compat.as_bytes("CPU:0"), outputs[0])
-    self.assertIn(compat.as_bytes("CPU:1"), outputs[1])
-    self.assertIn(compat.as_bytes("CPU:2"), outputs[2])
-
-  @test_util.run_deprecated_v1
-  def testAssignAddResourceVariable(self):
-
-    v = resource_variable_ops.ResourceVariable(1.0)
-
-    @function.Defun()
-    def AssignAdd():
-      v.assign_add(1.0)
-
-    op = functional_ops.partitioned_call(
-        args=AssignAdd.captured_inputs, f=AssignAdd)
-    _ = self.evaluate(variables.global_variables_initializer())
-    _ = self.evaluate(op)
-    value = self.evaluate(v.read_value())
-    self.assertEqual(value, 2.0)
-
-  @test_util.run_deprecated_v1
-  def testFunctionWithResourcesOnDifferentDevices(self):
-    if not test_util.is_gpu_available():
-      self.skipTest("No GPUs available.")
-
-    with ops.device("/cpu:0"):
-      v_cpu_zero = resource_variable_ops.ResourceVariable(
-          [0.0, 1.0, 2.0], name="v_cpu_zero")
-
-    with ops.device("/cpu:1"):
-      v_cpu_one = resource_variable_ops.ResourceVariable(
-          [0.0, 1.0, 2.0], name="v_cpu_one")
-
-    with ops.device("/gpu:0"):
-      v_gpu = resource_variable_ops.ResourceVariable(
-          [0.0, 1.0, 2.0], name="v_gpu")
-
-    def sum_gather():
-      cpu_result = math_ops.reduce_sum(array_ops.gather(v_cpu_zero, [1, 2]))
-      also_cpu_result = math_ops.reduce_sum(array_ops.gather(v_cpu_one, [1, 2]))
-      gpu_result = math_ops.reduce_sum(array_ops.gather(v_gpu, [1, 2]))
-      return cpu_result, also_cpu_result, gpu_result
-
-    defined = function.Defun()(sum_gather)
-    with self.test_session(
-        config=config_pb2.ConfigProto(
-            allow_soft_placement=False,
-            log_device_placement=True,
-            device_count={"CPU": 2})) as sess:
-      self.evaluate(variables.global_variables_initializer())
-      expected = self.evaluate(sum_gather())
-      result = sess.run(
-          functional_ops.partitioned_call(
-              args=defined.captured_inputs, f=defined))
-      self.assertAllEqual(expected, result)
-
-  # Use an invalid executor name to test the plumbing of the executor_type attr.
-  @test_util.run_v1_only("b/120545219")
-  def testExecutorTypeAttrExecutorNotFound(self):
-    @function.Defun(dtypes.int32)
-    def AddFive(x):
-      return x + 5
-
-    op = functional_ops.partitioned_call(
-        args=[constant_op.constant([1, 2, 3], dtype=dtypes.int32)],
-        f=AddFive,
-        executor_type="NON_EXISTENT_EXECUTOR")
-    with self.assertRaisesRegex(errors.NotFoundError, "NON_EXISTENT_EXECUTOR"):
-      self.evaluate(op)
-
-
 @test_util.run_all_in_graph_and_eager_modes
 @test_util.with_control_flow_v2
 class FunctionalOpsCaseTest(test.TestCase):
 
   def testCase(self):
-    @eager_function.defun
+    @eager_def_function.function
     def two(x):
       return x * 2
 
-    @eager_function.defun
+    @eager_def_function.function
     def three(x):
       return x * 3
 
-    @eager_function.defun
+    @eager_def_function.function
     def four(x):
       return x * 4
 
@@ -1318,7 +1167,7 @@ class FunctionalOpsCaseTest(test.TestCase):
   @test_util.disable_xla("Don't lower for XLA")
   def testCaseLowering(self):
     for use_gpu in (True, False):
-      @eager_function.defun
+      @eager_def_function.function
       def Run(branch, x):
         @function.Defun(dtypes.float32)
         def two(x):

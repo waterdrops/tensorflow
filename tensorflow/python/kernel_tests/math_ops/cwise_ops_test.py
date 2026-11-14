@@ -1223,7 +1223,8 @@ class ComplexMakeRealImagTest(test.TestCase):
               math_ops.square(math_ops.imag(cplx)))
       epsilon = 1e-3
       jacob_t, jacob_n = gradient_checker.compute_gradient(
-          inx, list(x.shape), loss, [1], x_init_value=x, delta=epsilon)
+          inx, list(x.shape), loss, list(loss.shape), x_init_value=x,
+          delta=epsilon)
     self.assertAllClose(jacob_t, jacob_n, rtol=epsilon, atol=epsilon)
 
   def _compareBroadcastGradient(self, x):
@@ -1285,10 +1286,10 @@ class PolyvalTest(test.TestCase):
     x = np.random.rand(2, 2).astype(dtype)
     coeffs = [np.random.rand(2, 2).astype(dtype) for _ in range(degree + 1)]
     np_val = np.polyval(coeffs, x)
-    with self.cached_session():
-      tf_val = math_ops.polyval(coeffs, x)
-      self.assertAllClose(np_val, self.evaluate(tf_val))
+    tf_val = math_ops.polyval(coeffs, x)
+    self.assertAllClose(np_val, self.evaluate(tf_val))
 
+  @test_util.run_in_graph_and_eager_modes
   def testSimple(self):
     for dtype in [
         np.int32, np.float32, np.float64, np.complex64, np.complex128
@@ -1297,6 +1298,7 @@ class PolyvalTest(test.TestCase):
         with self.subTest(dtype=dtype, degree=degree):
           self._runtest(dtype, degree)
 
+  @test_util.run_in_graph_and_eager_modes
   def testBroadcast(self):
     dtype = np.float32
     degree = 3
@@ -1310,23 +1312,136 @@ class PolyvalTest(test.TestCase):
               for _ in range(degree + 1)
           ]
           np_val = np.polyval(coeffs, x)
-          with self.cached_session():
-            tf_val = math_ops.polyval(coeffs, x)
-            self.assertAllClose(np_val, self.evaluate(tf_val))
+          tf_val = math_ops.polyval(coeffs, x)
+          self.assertAllClose(np_val, self.evaluate(tf_val))
 
+  @test_util.run_in_graph_and_eager_modes
   def testEmpty(self):
     x = np.random.rand(2, 2).astype(np.float32)
     coeffs = []
     np_val = np.polyval(coeffs, x)
-    with self.cached_session():
-      tf_val = math_ops.polyval(coeffs, x)
-      self.assertAllClose(np_val, self.evaluate(tf_val))
+    tf_val = math_ops.polyval(coeffs, x)
+    self.assertAllClose(np_val, self.evaluate(tf_val))
 
+  @test_util.run_in_graph_and_eager_modes
+  def testSingleCoeffNanPropagation(self):
+    x = np.array([1.0, float("nan"), 3.0], dtype=np.float32)
+    coeffs = [np.float32(2.0)]
+    np_val = np.polyval(coeffs, x)
+    tf_val = math_ops.polyval(coeffs, x)
+    self.assertAllClose(np_val, self.evaluate(tf_val))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSingleCoeffShapeBroadcast(self):
+    x = np.random.rand(3, 4).astype(np.float32)
+    coeffs = [np.float32(5.0)]
+    np_val = np.polyval(coeffs, x)
+    tf_val = math_ops.polyval(coeffs, x)
+    self.assertEqual(tf_val.shape, x.shape)
+    self.assertAllClose(np_val, self.evaluate(tf_val))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testSingleCoeffInfReturnsNan(self):
+    # Degree-0 polynomials return NaN for +/-inf inputs: the x * 0 step in
+    # math_ops.py both broadcasts x's shape and propagates NaN, and IEEE 754
+    # specifies 0 * inf = NaN (matching numpy.polyval behavior).
+    for dtype in [
+        np.float16,
+        np.float32,
+        np.float64,
+        np.complex64,
+        np.complex128,
+    ]:
+      for x_val in [float("inf"), float("-inf")]:
+        for x_np in [
+            np.array(x_val, dtype=dtype),
+            np.full(3, x_val, dtype=dtype),
+        ]:
+          with self.subTest(dtype=dtype, x=x_val, scalar=x_np.shape == ()):
+            coeffs = [dtype(2.0)]
+            tf_val = math_ops.polyval(coeffs, x_np)
+            result = self.evaluate(tf_val)
+            self.assertEqual(tf_val.shape, x_np.shape)
+            if np.issubdtype(dtype, np.complexfloating):
+              self.assertTrue(np.all(np.isnan(np.real(result))))
+            else:
+              self.assertTrue(np.all(np.isnan(result)))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testInfXReturnsInf(self):
+    """Tests that +/-inf x evaluates to inf for degree >= 1 polynomials.
+
+    Covers inf inputs only: NaN x inputs correctly propagate to NaN (NaN
+    propagation) rather than returning inf.
+    """
+    # inf x must evaluate to inf (not nan): the limit of a polynomial such as
+    # p(x) = x + 1 as x -> inf is mathematically inf. NumPy returns nan here
+    # only because it starts its Horner accumulator at zero (0 * inf -> nan).
+    # Complex dtypes are only checked at degree 1: at degree 2+ the
+    # complex multiply itself can produce a nan real part (e.g. complex128
+    # (inf+0j)**2 -> nan+nanj), which is inherent to complex inf arithmetic
+    # rather than accumulator initialization.
+    for dtype in [
+        np.float16,
+        np.float32,
+        np.float64,
+        np.complex64,
+        np.complex128,
+    ]:
+      degrees = [(1, [1.0, 1.0])]
+      if not np.issubdtype(dtype, np.complexfloating):
+        degrees.append((2, [1.0, 1.0, 1.0]))
+      for x_val in [float("inf"), float("-inf")]:
+        for degree, coeffs in degrees:
+          for x_np in [
+              np.array(x_val, dtype=dtype),
+              np.full(3, x_val, dtype=dtype),
+          ]:
+            with self.subTest(
+                dtype=dtype, x=x_val, degree=degree, scalar=x_np.shape == ()
+            ):
+              tf_val = math_ops.polyval([dtype(c) for c in coeffs], x_np)
+              result = self.evaluate(tf_val)
+              self.assertEqual(tf_val.shape, x_np.shape)
+              if np.issubdtype(dtype, np.complexfloating):
+                # Complex inf arithmetic can produce nan imaginary parts
+                # (e.g. (1+0j) * (inf+0j)); the real part must stay inf.
+                self.assertTrue(np.all(np.isinf(np.real(result))))
+              else:
+                self.assertTrue(np.all(np.isinf(result)))
+
+  @test_util.run_in_graph_and_eager_modes
   def test_coeffs_raise(self):
     x = np.random.rand(2, 2).astype(np.float32)
     coeffs = {}
     with self.assertRaisesRegex(ValueError, "Argument coeffs must be list"):
       math_ops.polyval(coeffs, x)
+
+
+class RealTest(test.TestCase):
+
+  def _run_test(self, input_values, expected_values):
+    res = math_ops.real(input_values)
+    self.assertAllEqual(res, expected_values)
+
+  def test_real(self):
+    test_cases = [
+        # Complex tensor
+        (np.complex64, [-2.25 + 4.75j, 3.25 + 5.75j], [-2.25, 3.25]),
+        (np.complex128, [-2.25 + 4.75j, 3.25 + 5.75j], [-2.25, 3.25]),
+        # Real tensor
+        (np.float32, [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]),
+        (np.float64, [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]),
+    ]
+
+    for dtype, input_values, expected_values in test_cases:
+      with self.subTest(dtype=dtype):
+        self._run_test(input_values, expected_values)
+
+  def test_real_raises_error_for_non_numeric_tensor(self):
+    x = np.array(["Hello", "World"])
+    with self.assertRaisesRegex(TypeError, "input must be a numeric tensor"):
+      self._run_test(x, None)
 
 
 if __name__ == "__main__":

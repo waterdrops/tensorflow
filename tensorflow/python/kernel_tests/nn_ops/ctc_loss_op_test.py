@@ -26,9 +26,11 @@ from tensorflow.python.framework import errors_impl
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import random_seed
 from tensorflow.python.framework import sparse_tensor
+from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import ctc_ops
+from tensorflow.python.ops import gen_ctc_ops
 from tensorflow.python.ops import gradients_impl
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
@@ -75,6 +77,355 @@ def _ctc_loss_v2(labels, inputs, sequence_length,
       label_length=None,
       blank_index=-1,
       logits_time_major=time_major)
+
+
+class CTCLossValidationTest(test.TestCase, parameterized.TestCase):
+
+  def _callCtcLoss(self, ctc_loss_fn, logits, blank_index=0):
+    labels = constant_op.constant([[0]], dtype=dtypes.int32)
+    label_length = constant_op.constant([1], dtype=dtypes.int32)
+    logit_length = constant_op.constant([1], dtype=dtypes.int32)
+    return ctc_loss_fn(
+        labels=labels,
+        logits=logits,
+        label_length=label_length,
+        logit_length=logit_length,
+        blank_index=blank_index,
+    )
+
+  def testStaticLogitsRankTooSmallRejected(self):
+    logits = constant_op.constant([[1.0, 2.0]], dtype=dtypes.float32)
+    for ctc_loss_fn in [ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3]:
+      with self.subTest(ctc_loss_fn=ctc_loss_fn.__name__):
+        with self.assertRaisesRegex(ValueError, "rank at least 3"):
+          self._callCtcLoss(ctc_loss_fn, logits)
+
+  def testStaticZeroClassesRejected(self):
+    logits = constant_op.constant(
+        np.zeros([1, 1, 0], dtype=np.float32), dtype=dtypes.float32
+    )
+    for ctc_loss_fn in [ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3]:
+      with self.subTest(ctc_loss_fn=ctc_loss_fn.__name__):
+        with self.assertRaisesRegex(ValueError, "at least 1 class"):
+          self._callCtcLoss(ctc_loss_fn, logits)
+
+  def testStaticBlankIndexOutOfRangeRejected(self):
+    logits = constant_op.constant(
+        np.zeros([1, 1, 3], dtype=np.float32), dtype=dtypes.float32
+    )
+    for ctc_loss_fn in [ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3]:
+      with self.subTest(ctc_loss_fn=ctc_loss_fn.__name__):
+        with self.assertRaisesRegex(ValueError, r"must be in range \[-3, 3\)"):
+          self._callCtcLoss(ctc_loss_fn, logits, blank_index=-4)
+
+  def _out_of_range_error(self, sparse, label):
+    """Returns the error regex expected for an out-of-range label id."""
+    if not sparse:
+      return r"All labels must be in the range \[0, num_classes\)"
+    if label < 0:
+      return r"All labels must be nonnegative integers"
+    return r"No label may be greater than num_classes"
+
+  def _make_labels(self, sparse, values):
+    """Creates a labels tensor for CTC loss testing."""
+    if sparse:
+      return sparse_tensor.SparseTensor(
+          indices=constant_op.constant(
+              [[0, i] for i in range(len(values))], dtype=dtypes.int64
+          ),
+          values=constant_op.constant(values, dtype=dtypes.int32),
+          dense_shape=constant_op.constant(
+              [1, len(values)], dtype=dtypes.int64
+          ),
+      )
+    return constant_op.constant([values], dtype=dtypes.int32)
+
+  def _call_ctc_loss_with_labels(
+      self, ctc_loss_fn, sparse, values, blank_index=-1
+  ):
+    """Invokes ctc_loss_fn with the provided label values and zero logits."""
+    logits = array_ops.zeros([3, 1, 10], dtype=dtypes.float32)
+    return ctc_loss_fn(
+        labels=self._make_labels(sparse, values),
+        logits=logits,
+        label_length=constant_op.constant([len(values)], dtype=dtypes.int32),
+        logit_length=constant_op.constant([3], dtype=dtypes.int32),
+        blank_index=blank_index,
+    )
+
+  @parameterized.product(
+      ctc_loss_fn=[ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3],
+      sparse=[True, False],
+      blank_index=[-1, 0],
+      label=[-2147483648, -1, 10, 2147483647],
+  )
+  def testOutOfRangeLabelRejected(
+      self, ctc_loss_fn, sparse, blank_index, label
+  ):
+    """Tests that out-of-range label ids are rejected in eager mode."""
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError,
+        self._out_of_range_error(sparse, label),
+    ):
+      self.evaluate(
+          self._call_ctc_loss_with_labels(
+              ctc_loss_fn, sparse, [label], blank_index=blank_index
+          )
+      )
+
+  @parameterized.product(
+      ctc_loss_fn=[ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3],
+      sparse=[True, False],
+      blank_index=[-1, 0],
+      label=[-2147483648, -1, 10, 2147483647],
+  )
+  def testOutOfRangeLabelRejectedInFunction(
+      self, ctc_loss_fn, sparse, blank_index, label
+  ):
+    """Tests that out-of-range label ids are rejected inside tf.function."""
+
+    @def_function.function
+    def test_fn():
+      return self._call_ctc_loss_with_labels(
+          ctc_loss_fn, sparse, [label], blank_index=blank_index
+      )
+
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError,
+        self._out_of_range_error(sparse, label),
+    ):
+      self.evaluate(test_fn())
+
+  @parameterized.product(blank_index=[-1, 0])
+  def testOutOfRangeInt32MinLabelRejectedInFunctionWithGradient(
+      self, blank_index
+  ):
+    """INT32_MIN in a real label is rejected when a gradient is built."""
+
+    @def_function.function
+    def test_fn():
+      logits = array_ops.zeros([3, 1, 10], dtype=dtypes.float32)
+      with backprop.GradientTape() as tape:
+        tape.watch(logits)
+        loss = ctc_ops.ctc_loss_v3(
+            labels=constant_op.constant([[-2147483648]], dtype=dtypes.int32),
+            logits=logits,
+            label_length=constant_op.constant([1], dtype=dtypes.int32),
+            logit_length=constant_op.constant([3], dtype=dtypes.int32),
+            blank_index=blank_index,
+        )
+      return loss, tape.gradient(loss, logits)
+
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError,
+        r"All labels must be in the range \[0, num_classes\)",
+    ):
+      self.evaluate(test_fn())
+
+  @parameterized.product(
+      ctc_loss_fn=[ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3],
+      sparse=[True, False],
+  )
+  def testInRangeLabelsStillAccepted(self, ctc_loss_fn, sparse):
+    """Tests that valid labels are still accepted."""
+    loss = self.evaluate(
+        self._call_ctc_loss_with_labels(ctc_loss_fn, sparse, [0, 9])
+    )
+    self.assertAllEqual(loss.shape, [1])
+    self.assertTrue(np.all(np.isfinite(loss)))
+
+  def testDensePaddingNegativeValueIgnored(self):
+    """Padding with -1 past label_length must be ignored (negative OOB)."""
+    logits = array_ops.zeros([3, 1, 10], dtype=dtypes.float32)
+    # Reference: label [3], no padding.
+    loss_ref = self.evaluate(
+        ctc_ops.ctc_loss_v3(
+            labels=constant_op.constant([[3, 0]], dtype=dtypes.int32),
+            logits=logits,
+            label_length=constant_op.constant([1], dtype=dtypes.int32),
+            logit_length=constant_op.constant([3], dtype=dtypes.int32),
+            blank_index=-1,
+        )
+    )
+    # Same label with invalid padding value -1 past label_length.
+    loss_padded = self.evaluate(
+        ctc_ops.ctc_loss_v3(
+            labels=constant_op.constant([[3, -1]], dtype=dtypes.int32),
+            logits=logits,
+            label_length=constant_op.constant([1], dtype=dtypes.int32),
+            logit_length=constant_op.constant([3], dtype=dtypes.int32),
+            blank_index=-1,
+        )
+    )
+    self.assertAllClose(loss_ref, loss_padded)
+
+  def testDensePaddingPositiveOobValueIgnored(self):
+    """Padding with positive OOB ids (e.g. 10, 99) past label_length is ok."""
+    logits = array_ops.zeros([3, 1, 10], dtype=dtypes.float32)
+    loss_ref = self.evaluate(
+        ctc_ops.ctc_loss_v3(
+            labels=constant_op.constant([[3, 0]], dtype=dtypes.int32),
+            logits=logits,
+            label_length=constant_op.constant([1], dtype=dtypes.int32),
+            logit_length=constant_op.constant([3], dtype=dtypes.int32),
+            blank_index=-1,
+        )
+    )
+    for pad_val in [10, 99]:
+      loss_padded = self.evaluate(
+          ctc_ops.ctc_loss_v3(
+              labels=constant_op.constant([[3, pad_val]], dtype=dtypes.int32),
+              logits=logits,
+              label_length=constant_op.constant([1], dtype=dtypes.int32),
+              logit_length=constant_op.constant([3], dtype=dtypes.int32),
+              blank_index=-1,
+          )
+      )
+      self.assertAllClose(
+          loss_ref,
+          loss_padded,
+          msg=f"Padding value {pad_val} should be ignored",
+      )
+
+  @parameterized.product(
+      pad=[-2147483648, 2147483647],
+      blank_index=[-1, 0],
+  )
+  def testDensePaddingExtremeValueIgnoredWithGradient(self, pad, blank_index):
+    """Extreme int32 padding past label_length must not overflow in grad."""
+    logits = array_ops.zeros([3, 1, 10], dtype=dtypes.float32)
+    label_length = constant_op.constant([1], dtype=dtypes.int32)
+    logit_length = constant_op.constant([3], dtype=dtypes.int32)
+
+    def loss_and_grad(pad_val):
+      with backprop.GradientTape() as tape:
+        tape.watch(logits)
+        loss = ctc_ops.ctc_loss_v3(
+            labels=constant_op.constant([[3, pad_val]], dtype=dtypes.int32),
+            logits=logits,
+            label_length=label_length,
+            logit_length=logit_length,
+            blank_index=blank_index,
+        )
+      return loss, tape.gradient(loss, logits)
+
+    loss_ref, grad_ref = self.evaluate(loss_and_grad(0))
+    loss_padded, grad_padded = self.evaluate(loss_and_grad(pad))
+    self.assertAllClose(loss_ref, loss_padded)
+    self.assertAllClose(grad_ref, grad_padded)
+
+  @parameterized.product(blank_index=[-1, 2])
+  def testDenseUniqueWithBlankIndexMatchesDense(self, blank_index):
+    """The unique fast path with a non-zero blank matches the dense path."""
+    logits = constant_op.constant(
+        np.random.RandomState(0).randn(6, 2, 5).astype(np.float32)
+    )
+    labels = constant_op.constant([[1, 3, 0], [3, 0, 0]], dtype=dtypes.int64)
+    label_length = constant_op.constant([2, 1], dtype=dtypes.int32)
+    logit_length = constant_op.constant([6, 6], dtype=dtypes.int32)
+
+    def loss_and_grad(unique):
+      with backprop.GradientTape() as tape:
+        tape.watch(logits)
+        loss = ctc_ops.ctc_loss_dense(
+            labels=labels,
+            logits=logits,
+            label_length=label_length,
+            logit_length=logit_length,
+            unique=unique,
+            blank_index=blank_index,
+        )
+      return loss, tape.gradient(loss, logits)
+
+    loss_ref, grad_ref = self.evaluate(loss_and_grad(None))
+    loss_uniq, grad_uniq = self.evaluate(
+        loss_and_grad(ctc_ops.ctc_unique_labels(labels))
+    )
+    self.assertAllClose(loss_ref, loss_uniq)
+    self.assertAllClose(grad_ref, grad_uniq)
+
+  @parameterized.product(
+      ctc_loss_fn=[ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3],
+  )
+  def testUnknownRankLogitsRejected(self, ctc_loss_fn):
+    """Tests that unknown-rank logits do not crash _get_dim and reject OOB.
+
+    Dense labels route through ctc_loss_dense, which calls _get_dim on both
+    logits and labels.  Tracing with TensorSpec(shape=None) gives logits an
+    unknown rank (labels keep a static shape), exercising the fallback in
+    _get_dim.
+    """
+
+    @def_function.function(
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float32)]
+    )
+    def test_fn(logits):
+      return ctc_loss_fn(
+          labels=self._make_labels(False, [10]),
+          logits=logits,
+          label_length=constant_op.constant([1], dtype=dtypes.int32),
+          logit_length=constant_op.constant([3], dtype=dtypes.int32),
+          blank_index=-1,
+      )
+
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError,
+        self._out_of_range_error(False, 10),
+    ):
+      self.evaluate(test_fn(array_ops.zeros([3, 1, 10], dtype=dtypes.float32)))
+
+  @parameterized.product(
+      ctc_loss_fn=[ctc_ops.ctc_loss_v2, ctc_ops.ctc_loss_v3],
+  )
+  def testUnknownRankLogitsAccepted(self, ctc_loss_fn):
+    """Tests that valid labels with unknown-rank logits are accepted.
+
+    Uses blank_index=-1 so blank_index + _get_dim(logits, 2) is computed at
+    trace time, exercising blank_index_val under unknown rank.
+    """
+
+    @def_function.function(
+        input_signature=[tensor_spec.TensorSpec(None, dtypes.float32)]
+    )
+    def test_fn(logits):
+      return ctc_loss_fn(
+          labels=self._make_labels(False, [1, 2]),
+          logits=logits,
+          label_length=constant_op.constant([2], dtype=dtypes.int32),
+          logit_length=constant_op.constant([3], dtype=dtypes.int32),
+          blank_index=-1,
+      )
+
+    loss = self.evaluate(
+        test_fn(array_ops.zeros([3, 1, 10], dtype=dtypes.float32))
+    )
+    self.assertAllEqual(loss.shape, [1])
+    self.assertTrue(np.all(np.isfinite(loss)))
+
+  def testDensePaddingMixedLengths(self):
+    """Padding past each row's label_length is ignored per row."""
+    logits = array_ops.zeros([4, 2, 10], dtype=dtypes.float32)
+    label_length = constant_op.constant([1, 2], dtype=dtypes.int32)
+    logit_length = constant_op.constant([4, 4], dtype=dtypes.int32)
+
+    def loss(values):
+      return ctc_ops.ctc_loss_v3(
+          labels=constant_op.constant(values, dtype=dtypes.int32),
+          logits=logits,
+          label_length=label_length,
+          logit_length=logit_length,
+          blank_index=-1,
+      )
+
+    self.assertAllClose(
+        self.evaluate(loss([[3, 0], [4, 5]])),
+        self.evaluate(loss([[3, 99], [4, 5]])),
+    )
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError,
+        r"All labels must be in the range \[0, num_classes\)",
+    ):
+      self.evaluate(loss([[3, 0], [4, 10]]))
 
 
 class CTCLossTest(test.TestCase):
@@ -301,8 +652,44 @@ class CTCLossTest(test.TestCase):
                                   "batch_size must not be 0"):
         sess.run(_ctc_loss_v2(labels, inputs, sequence_lengths))
 
+  @test_util.run_in_graph_and_eager_modes
+  def testSingleClassBlankOnlyLabel(self):
+    # Regression test for a heap out-of-bounds write (reported as an
+    # AddressSanitizer bad-free) in the native CTC loss calculator.  With
+    # num_classes == 1 the only class is the blank label (index
+    # num_classes - 1 == 0), so the label value 0 collapses to an empty target
+    # sequence and the modified sequence l_prime is a single blank (U == 1).
+    # The forward/backward initialization used to unconditionally write the
+    # second row of the alpha/beta matrices, corrupting the heap.  This must
+    # instead compute a finite loss without crashing.
+    inputs = constant_op.constant([[[-1.0]]], dtype=dtypes.float32)
+    labels_indices = constant_op.constant([[0, 0]], dtype=dtypes.int64)
+    labels_values = constant_op.constant([0], dtype=dtypes.int32)
+    sequence_length = constant_op.constant([1], dtype=dtypes.int32)
 
-class CTCLossTestV2(test.TestCase):
+    loss, gradient = gen_ctc_ops.ctc_loss(
+        inputs=inputs,
+        labels_indices=labels_indices,
+        labels_values=labels_values,
+        sequence_length=sequence_length,
+        preprocess_collapse_repeated=False,
+        ctc_merge_repeated=False,
+        ignore_longer_outputs_than_inputs=False,
+    )
+
+    loss_value, gradient_value = self.evaluate((loss, gradient))
+    self.assertAllEqual(loss_value.shape, (1,))
+    self.assertAllEqual(gradient_value.shape, (1, 1, 1))
+    self.assertAllEqual(
+        np.ones_like(loss_value, dtype=np.bool_), np.isfinite(loss_value)
+    )
+    self.assertAllEqual(
+        np.ones_like(gradient_value, dtype=np.bool_),
+        np.isfinite(gradient_value),
+    )
+
+
+class CTCLossTestV2(test.TestCase, parameterized.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testCtcLossV2(self):
@@ -632,6 +1019,57 @@ class CTCLossTestV2(test.TestCase):
               rtol=2e-06,
               atol=2e-06)
 
+  @parameterized.parameters((False, 0), (True, 0), (False, -1), (True, -1))
+  def testCtcLossDenseWithUndefinedStaticDimensions(self, unique, blank_index):
+    random_seed.set_random_seed(5)
+
+    # Trace without a batch size and number of frames
+    batch_size = None
+    num_labels = 6
+    label_length = 5
+    num_frames = None
+
+    @def_function.function
+    def func(labels, logits, label_lengths, logit_lengths):
+      unique_labels = ctc_ops.ctc_unique_labels(labels) if unique else None
+      return ctc_ops.ctc_loss_dense(
+          labels=labels,
+          logits=logits,
+          label_length=label_lengths,
+          logit_length=logit_lengths,
+          unique=unique_labels,
+          blank_index=blank_index)
+
+    labels_spec = tensor_spec.TensorSpec([batch_size, label_length],
+                                         dtypes.int64)
+    logits_spec = tensor_spec.TensorSpec([num_frames, batch_size, num_labels],
+                                         dtypes.float32)
+    label_lengths_spec = tensor_spec.TensorSpec([batch_size], dtypes.int64)
+    logit_lengths_spec = tensor_spec.TensorSpec([batch_size], dtypes.int64)
+
+    f = func.get_concrete_function(
+        labels_spec, logits_spec, label_lengths_spec, logit_lengths_spec)
+
+    # Execute with a defined batch size and number of frames
+    batch_size = 8
+    num_frames = 12
+
+    logits = random_ops.random_uniform([num_frames, batch_size, num_labels])
+    labels = random_ops.random_uniform(
+        [batch_size, label_length], minval=1, maxval=num_labels,
+        dtype=dtypes.int64)
+
+    label_lengths = random_ops.random_uniform(
+        [batch_size], minval=2, maxval=label_length, dtype=dtypes.int64)
+    label_mask = array_ops.sequence_mask(
+        label_lengths, maxlen=label_length, dtype=label_lengths.dtype)
+    labels *= label_mask
+
+    logit_lengths = constant_op.constant(
+        [num_frames] * batch_size, dtype=dtypes.int64)
+
+    f(labels, logits, label_lengths, logit_lengths)
+
   def testCollapseRepeated(self):
     collapsed, new_seq_lengths = ctc_ops.collapse_repeated(
         labels=[[1, 3, 3, 3, 0],
@@ -936,18 +1374,20 @@ class CTCLossTestV2(test.TestCase):
           [[1.0, 2.0], [5.0, 8.0], [14.0, 20.0]], out)
 
 
-def _ctc_loss_v3(labels, logits, label_length, logit_length, use_gpu):
+def _ctc_loss_v3(labels, logits, label_length, logit_length, use_gpu,
+                 sparse=True):
   with test_util.device(use_gpu=use_gpu):
-    sparse_labels = ctc_ops.dense_labels_to_sparse(labels, label_length)
+    if sparse:
+      labels = ctc_ops.dense_labels_to_sparse(labels, label_length)
     with backprop.GradientTape() as t:
       t.watch(logits)
       ref_loss = ctc_ops.ctc_loss_v3(
-          labels=sparse_labels,
+          labels=labels,
           logits=logits,
           label_length=label_length,
           logit_length=logit_length,
           blank_index=0)
-    ref_grad = t.gradient(ref_loss, [logits])
+    ref_grad = t.gradient(ref_loss, logits)
     return ref_loss, ref_grad
 
 
@@ -1000,6 +1440,78 @@ class CTCLossTestV3(test.TestCase, parameterized.TestCase):
     self.assertAllClose(loss, ref_loss, atol=1e-6)
     self.assertAllClose(grad, ref_grad, atol=2e-6)
 
+  @parameterized.parameters([False, True])
+  def testCtcLossFp16(self, sparse_labels):
+    batch_size = 8
+    num_labels = 6
+    max_label_length = 5
+    num_frames = 12
+
+    labels = np.random.randint(1, num_labels, [batch_size, max_label_length])
+    labels = ops.convert_to_tensor(labels, dtypes.int64)
+    fp16_logits = np.random.uniform(size=[num_frames, batch_size, num_labels])
+    fp16_logits = ops.convert_to_tensor(fp16_logits, dtypes.float16)
+    label_length = np.random.randint(2, max_label_length, [batch_size])
+    label_length = ops.convert_to_tensor(label_length, dtypes.int64)
+
+    label_mask = array_ops.sequence_mask(
+        label_length, maxlen=max_label_length, dtype=label_length.dtype)
+    labels *= label_mask
+    logit_length = [num_frames] * batch_size
+
+    fp16_loss, fp16_grad = _ctc_loss_v3(
+        labels, fp16_logits, label_length, logit_length, use_gpu=True,
+        sparse=sparse_labels)
+    fp32_loss, fp32_grad = _ctc_loss_v3(
+        labels, math_ops.cast(fp16_logits, dtypes.float32), label_length,
+        logit_length, use_gpu=True, sparse=sparse_labels)
+
+    self.assertEqual(fp16_loss.dtype, dtypes.float16)
+    self.assertEqual(fp16_grad.dtype, dtypes.float16)
+    self.assertAllClose(
+        self.evaluate(fp16_loss),
+        self.evaluate(math_ops.cast(fp32_loss, dtypes.float16))
+    )
+    self.assertAllClose(
+        self.evaluate(fp16_grad),
+        self.evaluate(math_ops.cast(fp32_grad, dtypes.float16))
+    )
+
+  @parameterized.parameters([False, True])
+  def testCtcLossWithListLogits(self, sparse_labels):
+    batch_size = 8
+    num_labels = 6
+    max_label_length = 5
+    num_frames = 12
+
+    labels = np.random.randint(1, num_labels, [batch_size, max_label_length])
+    labels = ops.convert_to_tensor(labels, dtypes.int64)
+    logits = np.random.uniform(size=[num_frames, batch_size, num_labels])
+    label_length = np.random.randint(2, max_label_length, [batch_size])
+    label_length = ops.convert_to_tensor(label_length, dtypes.int64)
+
+    label_mask = array_ops.sequence_mask(
+        label_length, maxlen=max_label_length, dtype=label_length.dtype)
+    labels *= label_mask
+    logit_length = [num_frames] * batch_size
+    if sparse_labels:
+      labels = ctc_ops.dense_labels_to_sparse(labels, label_length)
+
+    list_loss = ctc_ops.ctc_loss_v3(
+        labels=labels,
+        logits=logits.tolist(),
+        label_length=label_length,
+        logit_length=logit_length,
+        blank_index=0)
+    tensor_loss = ctc_ops.ctc_loss_v3(
+        labels=labels,
+        logits=ops.convert_to_tensor(logits, dtypes.float32),
+        label_length=label_length,
+        logit_length=logit_length,
+        blank_index=0)
+
+    self.assertAllClose(self.evaluate(list_loss), self.evaluate(tensor_loss))
+
   @test_util.run_v2_only
   def testCtcLossAlgorithmFallback(self):
     """Test if GPU CTC loss can fallback to the correct algorithm."""
@@ -1032,6 +1544,69 @@ class CTCLossTestV3(test.TestCase, parameterized.TestCase):
 
     self.assertAllClose(loss, ref_loss, atol=1e-6)
     self.assertAllClose(grad, ref_grad, atol=2e-6)
+
+  @test_util.run_v2_only
+  def testGPULabelsIndicesOOBBatchIndexRaisesError(self):
+    """GPU CTCLossV2 rejects out-of-range labels_indices batch indices."""
+    if not test.is_gpu_available():
+      self.skipTest("Need GPU for testing.")
+    batch_size = 2
+    num_frames = 4
+    num_classes = 3
+    labels_values = constant_op.constant([1, 1], dtype=dtypes.int32)
+    logits = constant_op.constant(
+        np.zeros([num_frames, batch_size, num_classes], dtype=np.float32)
+    )
+    sequence_length = constant_op.constant(
+        [num_frames] * batch_size, dtype=dtypes.int32
+    )
+    for bad_batch in (99, -1):
+      labels_indices = constant_op.constant(
+          [[bad_batch, 0], [0, 1]], dtype=dtypes.int64
+      )
+      with ops.device("/GPU:0"):
+        with self.assertRaisesRegex(
+            errors_impl.InvalidArgumentError,
+            rf"labels_indices batch index {bad_batch} out of range",
+        ):
+          self.evaluate(
+              gen_ctc_ops.ctc_loss_v2(
+                  logits,
+                  labels_indices,
+                  labels_values,
+                  sequence_length,
+                  preprocess_collapse_repeated=False,
+                  ctc_merge_repeated=True,
+                  ignore_longer_outputs_than_inputs=False,
+              )
+          )
+
+  @test_util.run_v2_only
+  def testGPULabelsIndicesWrongColumnCountRaisesError(self):
+    """GPU CTCLossV2 requires labels_indices to have 2 columns."""
+    if not test.is_gpu_available():
+      self.skipTest("Need GPU for testing.")
+    logits = constant_op.constant(np.zeros([4, 2, 3], dtype=np.float32))
+    labels_values = constant_op.constant([1, 1], dtype=dtypes.int32)
+    sequence_length = constant_op.constant([4, 4], dtype=dtypes.int32)
+    for bad_indices in ([[0], [1]], [[0, 0, 99], [1, 0, 0]]):
+      labels_indices = constant_op.constant(bad_indices, dtype=dtypes.int64)
+      with ops.device("/GPU:0"):
+        with self.assertRaisesRegex(
+            errors_impl.InvalidArgumentError,
+            r"labels_indices second dimension must be 2",
+        ):
+          self.evaluate(
+              gen_ctc_ops.ctc_loss_v2(
+                  logits,
+                  labels_indices,
+                  labels_values,
+                  sequence_length,
+                  preprocess_collapse_repeated=False,
+                  ctc_merge_repeated=True,
+                  ignore_longer_outputs_than_inputs=False,
+              )
+          )
 
 
 @test_util.run_all_in_graph_and_eager_modes

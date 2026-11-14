@@ -16,7 +16,7 @@ limitations under the License.
 
 namespace tflite {
 
-const constexpr char* NnapiAccelerationTestParams::kAccelerationTestConfig =
+const char* const NnapiAccelerationTestParams::acceleration_test_config_ =
     R"(
 ## Every Test can be allowlisted or denylisted using a regexp on its test_id
 
@@ -155,6 +155,7 @@ ConvolutionOpTest/ConvolutionOpTest.SimpleTestLargeIrregularQuantized/.+,29
 ConvolutionOpTest/ConvolutionOpTest.SimpleTestQuantizedOutputMultiplierGreaterThan1/.+,29
 ConvolutionOpTest/ConvolutionOpTest.SimpleTestQuantizedWithDilation/.+,29
 ConvolutionOpTest/ConvolutionOpTest.SimplePerChannelTest/.+,29
+ConvolutionOpTest/ConvolutionOpTest.SimpleTestQuantizedGrouped/.+,29
 ConvolutionOpTest/ConvolutionOpTest/.+Hybrid.+,29/
 ConvolutionOpTest/ConvolutionOpTest/.+/\d+
 
@@ -281,6 +282,9 @@ Parameterized/LstmOpTest.+/7,29
 MaxMinOpTest/.+nt8Test,29
 MaximumOpTest/.+,29
 
+# mirror_pad_test
+MirrorPadTest/.+,1000007
+
 # mul_test
 FloatMulOpTest/.+
 
@@ -391,6 +395,11 @@ ResizeNearestNeighborOpTest/ResizeNearestNeighborOpTest.+HalfPixelCenters.*/0,30
 // Only models with constant size tensor are accelerated
 ResizeNearestNeighborOpTest/ResizeNearestNeighborOpTest/.+/0,29
 
+# reverse_test
+-ReverseOpTest/Int64.+
+-ReverseOpTest/Int16.+
+ReverseOpTest/.+,1000007
+
 # select_test
 -SelectOpTest/SelectBool
 -SelectOpTest.SelectInt16
@@ -404,6 +413,7 @@ SelectOpTest/.+,29
 -SliceOpTest/SliceOpTest/SliceInt64/.+
 -SliceOpTest/SliceOpTest/SliceBool/.+
 -SliceOpTest/SliceOpTest/SliceInt16/.+
+-SliceOpTest/SliceOpTest/SliceInt64StaticOutput/.*
 # Only constant tensors
 SliceOpTest/SliceOpTest/.+/0,29
 

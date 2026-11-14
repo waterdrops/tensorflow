@@ -82,8 +82,11 @@ def GetTestConfigsDicts(v1_fn,
     if data_format == "NCHW_VECT_C":
       continue
 
-    configs1 += [(data_format, use_gpu, dtypes.float16),
-                 (data_format, use_gpu, dtypes.float64)]
+    configs1 += [
+        (data_format, use_gpu, dtypes.float16),
+        (data_format, use_gpu, dtypes.float64),
+        (data_format, use_gpu, dtypes.bfloat16),
+    ]
 
   # Convert from tuple to dict and add v1/v2 versions.
   ret = []
@@ -184,14 +187,26 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
   def _isMaxPool(self, func):
     return func in (nn_ops.max_pool, nn_ops.max_pool_v2)
 
-  def _VerifyOneType(self, pool_func, input_sizes, ksize, strides, padding,
-                     data_format, data_type, expected, use_gpu, v2,
-                     use_negative_input=False):
+  def _VerifyOneType(
+      self,
+      pool_func,
+      input_sizes,
+      ksize,
+      strides,
+      padding,
+      data_format,
+      data_type,
+      expected,
+      use_gpu,
+      v2,
+      use_negative_input=False,
+      bfloat16_rtol=1e-2,
+  ):
     """Verifies the output values of the pooling function.
 
     Args:
-      pool_func: Function to be called, co.MaxPool, co.AvgPool,
-        or the Lua version.
+      pool_func: Function to be called, co.MaxPool, co.AvgPool, or the Lua
+        version.
       input_sizes: Input tensor dimensions.
       ksize: The kernel size dimensions
       strides: The stride dimensions
@@ -202,6 +217,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
       use_gpu: Whether we are running on GPU.
       v2: Whether to use v2 version.
       use_negative_input: If the input values should be negative.
+      bfloat16_rtol: relative tolerance for bfloat16.
     """
     # Check that this test is compatible with the hardware we have.  (Really
     # this should be done in GetTestConfigsDicts(), but when that runs, we
@@ -276,7 +292,9 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
       else:
         actual = self.evaluate(t)
         self.assertShapeEqual(actual, t)
-      self.assertAllCloseAccordingToType(expected, actual.flatten())
+      self.assertAllCloseAccordingToType(
+          expected, actual.flatten(), bfloat16_rtol=bfloat16_rtol
+      )
 
   def _VerifyOneTest(self, pool_func, input_sizes, ksize, strides, padding,
                      data_format, expected, use_gpu, v2,
@@ -376,6 +394,35 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         padding="VALID",
         expected=[],
         **kwargs)
+
+  @parameterized.parameters((1, 2, 1), (1, 4, 2), (0, 1, 1), (20, 21, 1))
+  @test_util.run_in_graph_and_eager_modes
+  def testAvgPoolValidEmptyOutput(self, rows, window, stride):
+    value = array_ops.zeros([1, rows, 10, 3])
+    output = nn_ops.avg_pool(
+        value,
+        ksize=[1, window, 2, 1],
+        strides=[1, stride, 1, 1],
+        padding="VALID",
+    )
+    self.assertEqual(output.shape.as_list(), [1, 0, 9, 3])
+    self.assertEqual(self.evaluate(output).shape, (1, 0, 9, 3))
+
+  @parameterized.parameters((1, 3), (0, 2))
+  @test_util.run_in_graph_and_eager_modes
+  def testAvgPoolNegativeOutput(self, rows, window):
+    with self.assertRaisesRegex(
+        (ValueError, errors_impl.InvalidArgumentError),
+        "Negative dimension size|Computed output size would be negative",
+    ):
+      self.evaluate(
+          nn_ops.avg_pool(
+              array_ops.zeros([1, rows, 10, 3]),
+              ksize=[1, window, 2, 1],
+              strides=[1, 1, 1, 1],
+              padding="VALID",
+          )
+      )
 
   @parameterized.parameters(GetTestConfigsDicts(nn_ops.avg_pool))
   @test_util.run_deprecated_v1
@@ -524,7 +571,9 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         strides=[1, 2, 2, 1],
         padding="SAME",
         expected=expected_output,
-        **kwargs)
+        bfloat16_rtol=3e-2,
+        **kwargs,
+    )
 
   @parameterized.parameters(GetTestConfigsDicts(nn_ops.avg_pool))
   @test_util.run_deprecated_v1
@@ -536,6 +585,18 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         padding="SAME",
         expected=[],
         **kwargs)
+
+  @test_util.run_in_graph_and_eager_modes
+  def testRawAvgPoolLargeKsizeRaiseError(self):
+    with self.assertRaises((ValueError, errors_impl.InvalidArgumentError)):
+      with self.cached_session():
+        t = gen_nn_ops.avg_pool(
+            value=np.ones([1, 1, 1, 1]),
+            ksize=[1, 9223372036854775807, 1, 1],
+            strides=[1, 1, 1, 1],
+            padding="SAME",
+            data_format="NHWC")
+        self.evaluate(t)
 
   @parameterized.parameters(
       GetTestConfigsDicts(nn_ops.max_pool, gen_nn_ops.max_pool_v2))
@@ -760,6 +821,78 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         expected=[],
         **kwargs)
 
+  @parameterized.parameters(
+      GetTestConfigsDicts(nn_ops.max_pool, gen_nn_ops.max_pool_v2))
+  @test_util.run_deprecated_v1
+  def testMaxPoolInvalidFilterSize(self, **kwargs):
+    with self.cached_session(use_gpu=test.is_gpu_available()):
+      t = constant_op.constant(1.0, shape=[1, 1, 1, 1])
+      with self.assertRaisesRegex(
+          (errors_impl.InvalidArgumentError, ValueError),
+          "Negative dimension size"):
+        t = self.evaluate(
+            nn_ops.max_pool(t, ksize=[1, 1, 2, 1], strides=1, padding="VALID"))
+
+  @test_util.run_in_graph_and_eager_modes
+  def testMaxPoolWithArgmaxKsizeOverflow(self):
+    with self.assertRaisesRegex(
+        (ValueError, errors_impl.InvalidArgumentError),
+        "ksize must be a positive int32 value",
+    ):
+      with self.cached_session():
+        t = gen_nn_ops.max_pool_with_argmax(
+            input=[[[[1, 1, 1]]]],
+            ksize=[1, -2**31, 4, 1],
+            strides=[1, 1000, 1, 7],
+            padding="SAME")
+        self.evaluate(t)
+
+  @test_util.run_in_graph_and_eager_modes
+  def testMaxPoolAttrOutOfInt32Range(self):
+    # Regression test for GitHub issue 128940: with oneDNN, a ksize or
+    # strides value outside the int32 range aborted the process while the
+    # graph was rewritten to use the oneDNN MaxPool and MaxPool3D kernels.
+    for rank, pool in ((4, nn_ops.max_pool), (5, nn_ops.max_pool3d)):
+      ones = [1] * rank
+      out_of_range = [1, 2**31] + [1] * (rank - 2)
+      for ksize, strides in ((out_of_range, ones), (ones, out_of_range)):
+        with self.subTest(rank=rank, ksize=ksize, strides=strides):
+          with self.assertRaisesRegex(
+              (ValueError, errors_impl.InvalidArgumentError),
+              "out of range for an int32",
+          ):
+            self.evaluate(
+                pool(
+                    array_ops.zeros(ones),
+                    ksize=ksize,
+                    strides=strides,
+                    padding="VALID",
+                )
+            )
+
+  @test_util.run_in_graph_and_eager_modes
+  @test_util.disable_xla(
+      "XLA handles NCHW_VECT_C without CPU MaxPoolingOp error"
+  )
+  def testMaxPoolNchwVectCOnCpuRaisesError(self):
+    # With oneDNN on, this MaxPool used to be rewritten to the oneDNN op, which
+    # rejects NCHW_VECT_C, and the process aborted.
+    x = array_ops.zeros([1, 2, 4, 4, 4], dtypes.float32)
+    with ops.device("/cpu:0"):
+      with self.assertRaisesRegex(
+          (errors_impl.InvalidArgumentError, ValueError),
+          "only supports NHWC on device type CPU",
+      ):
+        self.evaluate(
+            nn_ops.max_pool2d(
+                x,
+                ksize=2,
+                strides=2,
+                padding="VALID",
+                data_format="NCHW_VECT_C",
+            )
+        )
+
   # Tests for DepthwiseMaxPooling on CPU only.
   @parameterized.parameters(
       GetTestConfigsDicts(
@@ -882,8 +1015,8 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
   def _CompareMaxPoolingFwd(self, input_shape, ksize, strides, padding):
     # double datatype is currently not supported for pooling ops
     # on the ROCm platform
-    for dtype in [np.float32, np.float16] \
-        + [np.float64] if not test.is_built_with_rocm() else []:
+    for dtype in [np.float32, np.float16
+                 ] + [np.float64] if not test.is_built_with_rocm() else []:
       tensor_input = np.random.rand(*input_shape).astype(dtype)
       with self.cached_session():
         t = constant_op.constant(tensor_input, shape=input_shape)
@@ -899,8 +1032,8 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
                            padding):
     # double datatype is currently not supported for pooling ops
     # on the ROCm platform
-    for dtype in [np.float32, np.float16] \
-        + [np.float64] if not test.is_built_with_rocm() else []:
+    for dtype in [np.float32, np.float16, dtypes.bfloat16.as_numpy_dtype
+                 ] + [np.float64] if not test.is_built_with_rocm() else []:
       # Generate numbers in a narrow range, so that there are many duplicates
       # in the input.
       tensor_input = np.random.random_integers(0, 3, input_shape).astype(dtype)
@@ -926,14 +1059,19 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
       # The CPU version accumulates its gradient on fp16, so it's less
       # accurate than the GPU version that does the accumulation on fp32
       self.assertAllCloseAccordingToType(
-          cpu_val, gpu_val, half_rtol=0.01, half_atol=0.01)
+          cpu_val,
+          gpu_val,
+          half_rtol=0.01,
+          half_atol=0.01,
+          bfloat16_rtol=0.02,
+          bfloat16_atol=0.1)
 
   def _CompareMaxPoolingGradBk(self, input_shape, output_shape, ksize, strides,
                                padding):
     # double datatype is currently not supported for pooling ops
     # on the ROCm platform
-    for dtype in [np.float32, np.float16] \
-        + [np.float64] if not test.is_built_with_rocm() else []:
+    for dtype in [np.float32, np.float16, dtypes.bfloat16.as_numpy_dtype
+                 ] + [np.float64] if not test.is_built_with_rocm() else []:
       # Generate numbers in a narrow range, so that there are many duplicates
       # in the input.
       tensor_input = np.random.random_integers(0, 3, input_shape).astype(dtype)
@@ -994,6 +1132,32 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
                             [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
         self.assertAllEqual(argmax.ravel(), config.argmax)
 
+  def testDepthwiseMaxPoolingWithArgmax(self):
+    tensor_input = [89, 73, -109]
+    Config = collections.namedtuple("Config", ["use_gpu", "padding"])
+    configs = [
+        Config(False, "SAME"),
+        Config(False, "VALID"),
+        Config(True, "SAME"),
+        Config(True, "VALID"),
+    ]
+
+    for config in configs:
+      with GetDeviceScope(self, use_gpu=config.use_gpu):
+        t = constant_op.constant(tensor_input, shape=[1, 1, 1, 3])
+        out_op, argmax_op = nn_ops.max_pool_with_argmax(
+            t,
+            ksize=[1, 1, 1, 3],
+            strides=[1, 1, 1, 3],
+            padding=config.padding,
+        )
+        out, argmax = self.evaluate([out_op, argmax_op])
+        # TODO(b/259733542): Fix below asserts once bug is fixed.
+        # self.assertShapeEqual(out, out_op)
+        # self.assertShapeEqual(argmax, argmax_op)
+        self.assertAllClose(out.ravel(), [89, 73, -109])
+        self.assertAllClose(argmax.ravel(), [0, 1, 2])
+
   def testMaxPoolingGradWithArgmax(self):
     orig_input = [
         1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0,
@@ -1002,12 +1166,15 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
     tensor_input = [11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 24.0]
 
     Config = collections.namedtuple(
-        "Config", ["use_gpu", "include_batch_in_index", "argmax"])
+        "Config", ["use_gpu", "include_batch_in_index", "argmax", "Targmax"]
+    )
     configs = [
-        Config(False, False, [0, 1, 3, 5, 0, 2, 6, 8]),
-        Config(False, True, [0, 1, 3, 5, 9, 11, 15, 17]),
-        Config(True, False, [0, 1, 3, 5, 0, 2, 6, 8]),
-        Config(True, True, [0, 1, 3, 5, 9, 11, 15, 17])
+        Config(False, False, [0, 1, 3, 5, 0, 2, 6, 8], dtypes.int64),
+        Config(False, True, [0, 1, 3, 5, 9, 11, 15, 17], dtypes.int64),
+        Config(False, False, [0, 1, 3, 5, 0, 2, 6, 8], dtypes.int32),
+        Config(False, True, [0, 1, 3, 5, 9, 11, 15, 17], dtypes.int32),
+        Config(True, False, [0, 1, 3, 5, 0, 2, 6, 8], dtypes.int64),
+        Config(True, True, [0, 1, 3, 5, 9, 11, 15, 17], dtypes.int64),
     ]
 
     for config in configs:
@@ -1015,7 +1182,8 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         orig_in = constant_op.constant(orig_input, shape=[2, 3, 3, 1])
         t = constant_op.constant(tensor_input, shape=[2, 2, 2, 1])
         argmax_t = constant_op.constant(
-            config.argmax, shape=[2, 2, 2, 1], dtype=dtypes.int64)
+            config.argmax, shape=[2, 2, 2, 1], dtype=config.Targmax
+        )
         out_op = gen_nn_ops.max_pool_grad_with_argmax(
             orig_in,
             t,
@@ -1035,8 +1203,8 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
       try:
         config_exec.enable_op_determinism()
         orig_input = [
-            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 1.0
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 1.0
         ]
         tensor_input = [11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 24.0]
 
@@ -1045,9 +1213,9 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
           t = constant_op.constant(tensor_input, shape=[2, 2, 2, 1])
           argmax_t = constant_op.constant(
               [0, 1, 3, 5, 0, 2, 6, 8], shape=[2, 2, 2, 1], dtype=dtypes.int64)
-          with self.assertRaisesRegexp(
-              errors_impl.UnimplementedError, "Determinism is not yet supported "
-              "for MaxPoolGradWithArgmax."):
+          with self.assertRaisesRegex(
+              errors_impl.UnimplementedError, "Determinism is not yet supported"
+              " for MaxPoolGradWithArgmax."):
             out_op = gen_nn_ops.max_pool_grad_with_argmax(
                 orig_in,
                 t,
@@ -1063,8 +1231,8 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
       try:
         config_exec.enable_op_determinism()
         orig_input = [
-            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 1.0
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 1.0
         ]
         tensor_input = [11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 24.0]
 
@@ -1166,7 +1334,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         err_tolerance = 1e-4
       else:
         if x_init_value is None:
-          x_init_value = np.asfarray(
+          x_init_value = np.asarray(
               np.arange(1, total_size + 1),
               dtype=np.float32).reshape(input_sizes)
         func_name = "max_pool"
@@ -1244,7 +1412,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         err_tolerance = 1e-3
       else:
         if x_init_value is None:
-          x_init_value = np.asfarray(
+          x_init_value = np.asarray(
               np.arange(1, total_size + 1),
               dtype=np.float32).reshape(input_sizes)
         func_name = "max_pool"
@@ -2128,6 +2296,37 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
       self._testAvgPoolGradSamePadding2_2(data_format, use_gpu)
       self._testAvgPoolGradSamePadding3_1(data_format, use_gpu)
 
+  def testAvgPoolGradOutputWithZeroDim(self):
+    for data_format, use_gpu in GetTestConfigs():
+      with self.cached_session(use_gpu=use_gpu):
+        if data_format == "NHWC":
+          orig_input_shape = [1, 2, 1, 1]
+          grad_shape = [1, 2, 0, 1]
+          ksize = [1, 1, 2, 1]
+          strides = [1, 1, 1, 1]
+        elif data_format == "NCHW":
+          orig_input_shape = [1, 1, 2, 1]
+          grad_shape = [1, 1, 2, 0]
+          ksize = [1, 1, 1, 2]
+          strides = [1, 1, 1, 1]
+        else:
+          continue
+
+        grad = constant_op.constant(
+            np.full(grad_shape, 0.1, dtype=np.float32), dtype=dtypes.float32
+        )
+        t = gen_nn_ops.AvgPoolGrad(
+            orig_input_shape=orig_input_shape,
+            grad=grad,
+            ksize=ksize,
+            strides=strides,
+            padding="VALID",
+            data_format=data_format,
+        )
+        values = self.evaluate(t)
+        self.assertEqual(values.shape, tuple(orig_input_shape))
+        self.assertAllClose(values, np.zeros(orig_input_shape))
+
   def _testAvgPoolGradValidPadding1_1(self, data_format, use_gpu):
     self._ConstructAndTestGradient(
         nn_ops.avg_pool,
@@ -2245,6 +2444,77 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
         data_format=data_format,
         use_gpu=use_gpu)
 
+  @test_util.disable_xla("Xla does not raise error on out of bounds access")
+  def testAvgPoolGradOutputMemoryOutOfBounds(self):
+    with self.assertRaisesRegex(
+        errors_impl.InvalidArgumentError,
+        r"Expected grad shape to be \[1,1,3,1\], but got \[3,1,3,1\]",
+    ):
+      self.evaluate(
+          gen_nn_ops.AvgPoolGrad(
+              orig_input_shape=[1, 1, 3, 1],
+              grad=[
+                  [[[1.0], [2.0], [3.0]]],
+                  [[[4.0], [5.0], [6.0]]],
+                  [[[7.0], [8.0], [9.0]]],
+              ],
+              ksize=[1, 1, 1, 1],
+              strides=[1, 1, 1, 2],
+              padding="VALID",
+              data_format="NHWC",
+          )
+      )
+
+  @test_util.run_in_graph_and_eager_modes
+  @test_util.disable_xla("Xla does not raise error on out of bounds access")
+  def testAvgPoolGradMismatchedGradShapeRaisesError(self):
+    # Each grad has a different number of channels than the input. With more
+    # channels, the CPU kernel used to write past the end of its output buffer
+    # instead of raising an error.
+    for orig_input_shape, grad_shape, ksize, expected in (
+        (
+            [1, 28, 28, 3],
+            [1, 14, 14, 6],
+            2,
+            r"\[1,14,14,3\], but got " r"\[1,14,14,6\]",
+        ),
+        ([2, 2, 2, 2], [2, 3, 3, 3], 1, r"\[2,2,2,2\], but got \[2,3,3,3\]"),
+        ([1, 10, 10, 3], [1, 5, 5, 0], 2, r"\[1,5,5,3\], but got \[1,5,5,0\]"),
+    ):
+      with self.assertRaisesRegex(
+          (errors_impl.InvalidArgumentError, ValueError),
+          "Expected grad shape to be " + expected,
+      ):
+        self.evaluate(
+            gen_nn_ops.AvgPoolGrad(
+                orig_input_shape=orig_input_shape,
+                grad=array_ops.zeros(grad_shape),
+                ksize=[1, ksize, ksize, 1],
+                strides=[1, ksize, ksize, 1],
+                padding="VALID",
+                data_format="NHWC",
+            )
+        )
+
+  @test_util.run_in_graph_and_eager_modes
+  def testAvgPoolGradEmptyTensorFastExit(self):
+    for empty_input_shape, empty_grad_shape in (
+        ([0, 10, 10, 3], [0, 5, 5, 3]),
+        ([1, 0, 10, 3], [1, 0, 5, 3]),
+        ([1, 10, 10, 0], [1, 5, 5, 0]),
+        ([1, 1, 10, 3], [1, 0, 5, 3]),
+    ):
+      self.evaluate(
+          gen_nn_ops.AvgPoolGrad(
+              orig_input_shape=empty_input_shape,
+              grad=array_ops.zeros(empty_grad_shape),
+              ksize=[1, 2, 2, 1],
+              strides=[1, 2, 2, 1],
+              padding="VALID",
+              data_format="NHWC",
+          )
+      )
+
   @test_util.run_deprecated_v1
   def testShapeFunctionEdgeCases(self):
     # All shapes unknown.
@@ -2294,6 +2564,9 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
                     strides=[2, 1, 1, 1],
                     padding="SAME"))
 
+        # AvgPool accepts zero-sized outputs; MaxPool keeps its existing check.
+        if pool_func == nn_ops.avg_pool:
+          continue
         # Filter too large.
         with self.assertRaisesRegex(ValueError, "Negative dimension size"):
           sess.run(
@@ -2311,7 +2584,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
 
   @test_util.run_deprecated_v1
   def testEdgeCasesRaiseErrors(self):
-    with self.assertRaisesRegexp(
+    with self.assertRaisesRegex(
         ValueError, "NCHW_VECT_C.*is not supported with "
         "explicit padding|XLA does not support pooling ops with explicit "
         "padding"):
@@ -2321,7 +2594,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
           strides=[1, 2, 2, 1],
           padding=[[0, 0], [0, 1], [0, 1], [0, 0]],
           data_format="NCHW_VECT_C")
-    with self.assertRaisesRegexp(
+    with self.assertRaisesRegex(
         ValueError, "Explicit padding is not supported with an input "
                     "tensor of rank 5"):
       nn_ops.max_pool_v2(
@@ -2330,7 +2603,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
           strides=[1, 2, 2, 1, 1],
           padding=[[0, 0], [0, 1], [0, 1], [0, 0]],
           data_format="NCHW")
-    with self.assertRaisesRegexp(
+    with self.assertRaisesRegex(
         ValueError, "Attr 'padding' of 'MaxPoolV2' Op passed "
                     "string 'EXPLICIT'"):
       gen_nn_ops.max_pool_v2(
@@ -2343,7 +2616,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
   @test_util.run_deprecated_v1
   def testEdgeCasesExcessPadding(self):
     with self.session(use_gpu=test.is_gpu_available()) as sess:
-      with self.assertRaisesRegexp(
+      with self.assertRaisesRegex(
           (errors_impl.UnimplementedError, errors_impl.InvalidArgumentError),
           "Right padding 2 needs to be smaller than the window size 2|"
           "XLA does not support pooling ops with explicit padding"):
@@ -2361,7 +2634,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
   @test_util.run_deprecated_v1
   def testNegativePadding(self):
     with self.session(use_gpu=test.is_gpu_available()) as sess:
-      with self.assertRaisesRegexp(
+      with self.assertRaisesRegex(
           ValueError, "All elements of explicit_paddings must be "
                       "nonnegative for"):
         input_sizes = [1, 3, 3, 1]
@@ -2378,7 +2651,7 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
   @test_util.run_deprecated_v1
   def testExplicitPaddingBatch(self):
     with self.session(use_gpu=test.is_gpu_available()) as sess:
-      with self.assertRaisesRegexp(
+      with self.assertRaisesRegex(
           ValueError, "Nonzero explicit padding in the batch or depth "
                       "dimensions is not supported"):
         input_sizes = [1, 3, 3, 1]
@@ -2469,6 +2742,60 @@ class PoolingTest(test.TestCase, parameterized.TestCase):
           gen_nn_ops.max_pool_grad_grad_with_argmax(
               inp, grad, argmax, ksize=[1, 1, 1, 1], strides=[1, 1, 1, 1],
               padding="VALID")
+
+  def testMaxPoolGradWithArgmaxInvalidArgmaxIndices(self):
+    # Tests that out-of-bounds argmax indices do not cause process crash (on CPU)
+    # or OOB writes (on GPU). Let it skip invalid indices gracefully instead
+    # of hitting fatal CHECK failures.
+    with self.cached_session():
+      inp = array_ops.ones((1, 3, 3, 1), dtype=dtypes.float32)
+      grad = array_ops.ones((1, 3, 3, 1), dtype=dtypes.float32)
+      # 999999 is out of bounds
+      argmax = constant_op.constant(
+          [999999] + [0] * 8, dtype=dtypes.int64, shape=[1, 3, 3, 1]
+      )
+
+      # This should execute without CRASH
+      res = gen_nn_ops.max_pool_grad_with_argmax(
+          inp,
+          grad,
+          argmax,
+          ksize=[1, 1, 1, 1],
+          strides=[1, 1, 1, 1],
+          padding="VALID",
+      )
+      self.evaluate(res)
+
+  def testAvgPoolGradInvalidInputShapeRaiseError(self):
+    with self.assertRaises((ValueError, errors_impl.InvalidArgumentError)):
+      with self.cached_session():
+        orig_input_shape = constant_op.constant(
+            -536870912, shape=[4], dtype=dtypes.int32)
+        grad = constant_op.constant(
+            .0890338004362538, shape=[1, 5, 7, 1], dtype=dtypes.float64)
+        t = gen_nn_ops.AvgPoolGrad(
+            orig_input_shape=orig_input_shape,
+            grad=grad,
+            ksize=[1, 2, 2, 1],
+            strides=[1, 2, 2, 1],
+            padding="VALID",
+            data_format="NHWC")
+        self.evaluate(t)
+
+  def testAvgPoolGradInvalidStrideRaiseErrorProperly(self):
+    with self.assertRaises(errors_impl.InvalidArgumentError):
+      with self.cached_session():
+        orig_input_shape = [11, 9, 78, 9]
+        grad = constant_op.constant(
+            0.1, shape=[16, 16, 16, 16], dtype=dtypes.float64)
+        t = gen_nn_ops.AvgPoolGrad(
+            orig_input_shape=orig_input_shape,
+            grad=grad,
+            ksize=[1, 40, 128, 1],
+            strides=[1, 128, 128, 30],
+            padding="SAME",
+            data_format="NHWC")
+        self.evaluate(t)
 
 
 def GetMaxPoolFwdTest(input_size, filter_size, strides, padding):

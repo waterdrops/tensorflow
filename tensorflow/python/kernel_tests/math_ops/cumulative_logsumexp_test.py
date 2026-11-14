@@ -26,7 +26,12 @@ from tensorflow.python.platform import test
 
 
 class CumulativeLogsumexpTest(test.TestCase):
-  valid_dtypes = [dtypes.float32, dtypes.float64]
+  valid_dtypes = [
+      dtypes.float32,
+      dtypes.float64,
+      dtypes.float16,
+      dtypes.bfloat16,
+  ]
 
   def _computeLogSumExp(self, x, **kwargs):
     result_naive = math_ops.cumsum(math_ops.exp(x), **kwargs)
@@ -40,7 +45,8 @@ class CumulativeLogsumexpTest(test.TestCase):
       result_naive, result_fused = self.evaluate(
           self._computeLogSumExp(x, **kwargs))
 
-    self.assertAllClose(result_naive, result_fused)
+    tol = 2e-2 if dtype in [dtypes.float16, dtypes.bfloat16] else 1e-6
+    self.assertAllClose(result_naive, result_fused, rtol=tol, atol=tol)
 
   def _testLogSumExpAllArgs(self, x, axis=0, use_gpu=False):
     for dtype in self.valid_dtypes:
@@ -109,6 +115,34 @@ class CumulativeLogsumexpTest(test.TestCase):
         result_map = self.evaluate(self._logSumExpMap(x_tf))
 
       self.assertAllClose(result_fused, result_map)
+
+  def testPlusInfinity(self):
+    x = [np.inf, np.inf, 1.0, np.inf]
+    for dtype in self.valid_dtypes:
+      for use_gpu in (True, False):
+        with self.cached_session(use_gpu=use_gpu):
+          x_tf = ops.convert_to_tensor(x, dtype=dtype)
+          result = self.evaluate(math_ops.cumulative_logsumexp(x_tf))
+          expected = np.array(
+              [np.inf, np.inf, np.inf, np.inf], dtype=x_tf.dtype.as_numpy_dtype
+          )
+          self.assertAllClose(result, expected)
+
+  def testPlusInfinityAllInf(self):
+    # All-+inf input accumulated along a 2-D axis: every pairwise step is
+    # inf + inf, which yielded inf - inf = NaN before the +inf guard in the
+    # LogSumExp reducer.
+    x = np.array([[np.inf], [np.inf], [np.inf]])
+    for dtype in self.valid_dtypes:
+      for use_gpu in (True, False):
+        with self.cached_session(use_gpu=use_gpu):
+          x_tf = ops.convert_to_tensor(x, dtype=dtype)
+          result = self.evaluate(math_ops.cumulative_logsumexp(x_tf, axis=0))
+          self.assertAllEqual(
+              np.full((3, 1), np.inf),
+              result,
+              msg=f'Expected +inf outputs for all-inf input, got {result}',
+          )
 
 
 if __name__ == '__main__':

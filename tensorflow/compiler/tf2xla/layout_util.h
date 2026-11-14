@@ -18,15 +18,22 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_TF2XLA_LAYOUT_UTIL_H_
 #define TENSORFLOW_COMPILER_TF2XLA_LAYOUT_UTIL_H_
 
+#include <functional>
+#include <optional>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "tensorflow/compiler/tf2xla/xla_argument.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
-#include "tensorflow/compiler/xla/shape.h"
-#include "tensorflow/compiler/xla/statusor.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/ir/hlo_sharding.h"
+#include "xla/shape.h"
+#include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/platform/statusor.h"
 
 namespace tensorflow {
 
@@ -36,11 +43,21 @@ class XlaShapeLayoutHelpers {
   // The return value of LayoutPreferenceFn can be used in
   // XlaHelper::ShapeRepresentationFn.
   typedef std::function<XlaLayoutPreference(const TensorShape&, DataType,
-                                            absl::optional<XlaArgument::Kind>)>
+                                            std::optional<XlaArgument::Kind>)>
       LayoutPreferenceFn;
 
   // A bundle of LayoutPreferenceFn and ShapeRepresentationFn.
   struct ShapeDeterminationFns {
+    // Use no preference function, and identity shape representation function,
+    // as default value.
+    ShapeDeterminationFns();
+
+    ShapeDeterminationFns(
+        LayoutPreferenceFn layout_preference_fn,
+        XlaHelpers::ShapeRepresentationFn shape_representation_fn)
+        : layout_preference_fn(layout_preference_fn),
+          shape_representation_fn(shape_representation_fn) {}
+
     LayoutPreferenceFn layout_preference_fn;
     XlaHelpers::ShapeRepresentationFn shape_representation_fn;
   };
@@ -48,6 +65,19 @@ class XlaShapeLayoutHelpers {
 
 // Return a LayoutPreferenceFn that always uses kNoPreference layout.
 XlaShapeLayoutHelpers::LayoutPreferenceFn UseNoPreferenceLayoutFn();
+
+// Rewrites the layout of xla_shape if there is tiled sharding.
+absl::Status RewriteLayoutWithShardedShape(
+    const std::optional<xla::HloSharding>& sharding, bool use_fast_memory,
+    XlaShapeLayoutHelpers::ShapeDeterminationFns shape_determination_fns,
+    xla::Shape* xla_shape);
+
+// Adds reshapes to fix the layout of an output, if a shape_representation_fn or
+// sharding is present.
+absl::StatusOr<xla::XlaOp> ReshapeWithCorrectRepresentationAndSharding(
+    xla::XlaBuilder* builder, xla::XlaOp original, xla::Shape original_shape,
+    XlaShapeLayoutHelpers::ShapeDeterminationFns shape_determination_fns,
+    std::optional<xla::OpSharding> sharding, bool fast_mem);
 
 }  // namespace tensorflow
 

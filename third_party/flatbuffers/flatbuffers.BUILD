@@ -1,25 +1,42 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 load("@build_bazel_rules_android//android:rules.bzl", "android_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":build_defs.bzl", "flatbuffer_py_strip_prefix_srcs")
 
 package(default_visibility = ["//visibility:public"])
 
 licenses(["notice"])  # Apache 2.0
 
-exports_files(["LICENSE.txt"])
-
-licenses(["notice"])
+exports_files(["LICENSE"])
 
 config_setting(
-    name = "freebsd",
+    name = "platform_freebsd",
     values = {"cpu": "freebsd"},
+)
+
+config_setting(
+    name = "platform_openbsd",
+    values = {"cpu": "openbsd"},
 )
 
 config_setting(
     name = "windows",
     values = {"cpu": "x64_windows"},
 )
-
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 # Public flatc library to compile flatbuffer files at runtime.
 cc_library(
@@ -35,10 +52,21 @@ cc_library(
 filegroup(
     name = "public_headers",
     srcs = [
+        "include/flatbuffers/allocator.h",
+        "include/flatbuffers/array.h",
         "include/flatbuffers/base.h",
+        "include/flatbuffers/buffer.h",
+        "include/flatbuffers/buffer_ref.h",
+        "include/flatbuffers/code_generator.h",
         "include/flatbuffers/code_generators.h",
+        "include/flatbuffers/default_allocator.h",
+        "include/flatbuffers/detached_buffer.h",
+        "include/flatbuffers/file_manager.h",
+        "include/flatbuffers/flatbuffer_builder.h",
         "include/flatbuffers/flatbuffers.h",
+        "include/flatbuffers/flex_flat_util.h",
         "include/flatbuffers/flexbuffers.h",
+        "include/flatbuffers/grpc.h",
         "include/flatbuffers/hash.h",
         "include/flatbuffers/idl.h",
         "include/flatbuffers/minireflect.h",
@@ -46,9 +74,15 @@ filegroup(
         "include/flatbuffers/reflection_generated.h",
         "include/flatbuffers/registry.h",
         "include/flatbuffers/stl_emulation.h",
+        "include/flatbuffers/string.h",
+        "include/flatbuffers/struct.h",
+        "include/flatbuffers/table.h",
         "include/flatbuffers/util.h",
+        "include/flatbuffers/vector.h",
+        "include/flatbuffers/vector_downward.h",
+        "include/flatbuffers/verifier.h",
     ],
-    visibility = ["//:__subpackages__"],
+    visibility = ["//visibility:public"],
 )
 
 # Public flatc compiler library.
@@ -65,9 +99,11 @@ cc_library(
 cc_binary(
     name = "flatc",
     linkopts = select({
-        ":freebsd": [
+        ":platform_freebsd": [
             "-lm",
         ],
+        # If Visual Studio 2022 developers facing linking errors,
+        # change the line below as ":windows": ["/DEFAULTLIB:msvcrt.lib"],
         ":windows": [],
         "//conditions:default": [
             "-lm",
@@ -85,18 +121,31 @@ filegroup(
     srcs = [
         "include/flatbuffers/flatc.h",
     ],
-    visibility = ["//:__subpackages__"],
+    visibility = ["//visibility:public"],
 )
 
 # Library used by flatbuffer_cc_library rules.
 cc_library(
     name = "runtime_cc",
     hdrs = [
+        "include/flatbuffers/allocator.h",
+        "include/flatbuffers/array.h",
         "include/flatbuffers/base.h",
+        "include/flatbuffers/buffer.h",
+        "include/flatbuffers/buffer_ref.h",
+        "include/flatbuffers/default_allocator.h",
+        "include/flatbuffers/detached_buffer.h",
+        "include/flatbuffers/flatbuffer_builder.h",
         "include/flatbuffers/flatbuffers.h",
         "include/flatbuffers/flexbuffers.h",
         "include/flatbuffers/stl_emulation.h",
+        "include/flatbuffers/string.h",
+        "include/flatbuffers/struct.h",
+        "include/flatbuffers/table.h",
         "include/flatbuffers/util.h",
+        "include/flatbuffers/vector.h",
+        "include/flatbuffers/vector_downward.h",
+        "include/flatbuffers/verifier.h",
     ],
     linkstatic = 1,
     strip_include_prefix = "/include",
@@ -107,9 +156,11 @@ flatbuffer_py_strip_prefix_srcs(
     name = "flatbuffer_py_strip_prefix",
     srcs = [
         "python/flatbuffers/__init__.py",
+        "python/flatbuffers/_version.py",
         "python/flatbuffers/builder.py",
         "python/flatbuffers/compat.py",
         "python/flatbuffers/encode.py",
+        "python/flatbuffers/flexbuffers.py",
         "python/flatbuffers/number_types.py",
         "python/flatbuffers/packer.py",
         "python/flatbuffers/table.py",
@@ -122,9 +173,11 @@ filegroup(
     name = "runtime_py_srcs",
     srcs = [
         "__init__.py",
+        "_version.py",
         "builder.py",
         "compat.py",
         "encode.py",
+        "flexbuffers.py",
         "number_types.py",
         "packer.py",
         "table.py",
@@ -140,7 +193,7 @@ py_library(
 
 filegroup(
     name = "runtime_java_srcs",
-    srcs = glob(["java/com/google/flatbuffers/**/*.java"]),
+    srcs = glob(["java/src/main/java/com/google/flatbuffers/**/*.java"]),
 )
 
 java_library(

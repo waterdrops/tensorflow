@@ -44,7 +44,7 @@ Status TrtPrecisionModeToName(const TrtPrecisionMode mode, string* name) {
   }
   if (name->compare(kUnknown) == 0)
     return errors::OutOfRange("Unknown precision mode");
-  return Status::OK();
+  return OkStatus();
 }
 
 Status TrtPrecisionModeFromName(const string& name, TrtPrecisionMode* mode) {
@@ -57,7 +57,7 @@ Status TrtPrecisionModeFromName(const string& name, TrtPrecisionMode* mode) {
   } else {
     return errors::InvalidArgument("Invalid precision mode name: ", name);
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 string DebugString(const TrtPrecisionMode mode) {
@@ -81,9 +81,7 @@ string ProfileStrategyToName(const ProfileStrategy strategy) {
 }
 
 Status ProfileStrategyFromName(const string& name, ProfileStrategy* strategy) {
-  string name_lowercase(name);
-  std::transform(name.begin(), name.end(), name_lowercase.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
+  std::string name_lowercase = absl::AsciiStrToLower(name);
   if (name_lowercase == "range") {
     *strategy = ProfileStrategy::kRange;
   } else if (name_lowercase == "optimal") {
@@ -95,7 +93,7 @@ Status ProfileStrategyFromName(const string& name, ProfileStrategy* strategy) {
   } else {
     return errors::InvalidArgument("Invalid profile strategy: ", name);
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 }  // namespace tensorrt

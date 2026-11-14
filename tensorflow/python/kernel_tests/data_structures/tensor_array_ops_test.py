@@ -30,7 +30,8 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import array_ops_stack
+from tensorflow.python.ops import cond
 from tensorflow.python.ops import control_flow_util
 from tensorflow.python.ops import data_flow_ops
 from tensorflow.python.ops import gen_data_flow_ops
@@ -41,6 +42,7 @@ from tensorflow.python.ops import tensor_array_grad
 from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables
+from tensorflow.python.ops import while_loop
 import tensorflow.python.ops.nn_grad  # pylint: disable=unused-import
 from tensorflow.python.platform import test
 
@@ -166,7 +168,7 @@ class TensorArrayTest(test.TestCase):
         return w2.concat()
 
       def _write(index, output):
-        elements = control_flow_ops.cond(
+        elements = cond.cond(
             math_ops.less(index, 3), _concat_1, _concat_2)
         return (index + 1, output.write(index, elements))
 
@@ -176,8 +178,8 @@ class TensorArrayTest(test.TestCase):
                         dtype=dtypes.int32,
                         size=num_iterations,
                         infer_shape=False))
-      _, final_state = control_flow_ops.while_loop(
-          lambda i, _: i < num_iterations, _write, init_state)
+      _, final_state = while_loop.while_loop(lambda i, _: i < num_iterations,
+                                             _write, init_state)
 
       c0 = final_state.concat()
 
@@ -302,6 +304,7 @@ class TensorArrayTest(test.TestCase):
     self._testTensorArrayUnpackRead(dtypes.complex64)
     self._testTensorArrayUnpackRead(dtypes.complex128)
     self._testTensorArrayUnpackRead(dtypes.string)
+    self._testTensorArrayUnpackRead(dtypes.bfloat16)
 
   def testTensorArrayUnpackRead(self):
     self._testTensorArrayUnpackReadMaybeLegacy()
@@ -357,6 +360,7 @@ class TensorArrayTest(test.TestCase):
     self._testTensorArraySplitRead(dtypes.complex64)
     self._testTensorArraySplitRead(dtypes.complex128)
     self._testTensorArraySplitRead(dtypes.string)
+    self._testTensorArraySplitRead(dtypes.bfloat16)
 
   @test_util.disable_control_flow_v2("v2 does not support TensorArray.grad.")
   @test_util.run_v1_only("v2 does not support TensorArray.grad.")
@@ -497,7 +501,10 @@ class TensorArrayTest(test.TestCase):
 
       if (control_flow_util.ENABLE_CONTROL_FLOW_V2 and
           not context.executing_eagerly()):
-        error_msg = "Trying to modify element -1 in a list with 3 elements."
+        error_msg = (
+            "Trying to modify element -1 in a list, but the index "
+            "must be non-negative."
+        )
       else:
         error_msg = "index -1"
       with self.assertRaisesOpError(error_msg):
@@ -604,19 +611,23 @@ class TensorArrayTest(test.TestCase):
           lengths = array_ops.placeholder(dtypes.int64)
           ta.split([1.0, 2.0, 3.0], lengths).flow.eval(feed_dict={lengths: 1})
 
-      error_msg = ("Unused values in tensor. Length of tensor: 3 Values used: 1"
-                   if control_flow_util.ENABLE_CONTROL_FLOW_V2 and
-                   not in_eager_mode else
-                   r"Expected sum of lengths to be equal to values.shape\[0\], "
-                   r"but sum of lengths is 1 and value's shape is: \[3\]")
-      with self.assertRaisesOpError(error_msg):
-        self.evaluate(ta.split([1.0, 2.0, 3.0], [1]).flow)
+      error_msg = (
+          r"Expected sum of lengths to be equal to values.shape\[0\], "
+          r"but sum of lengths is 1 and value's shape is: \[3\]"
+      )
+      if in_eager_mode:
+        with self.assertRaisesOpError(error_msg):
+          self.evaluate(ta.split([1.0, 2.0, 3.0], [1]).flow)
+      else:
+        with self.assertRaisesRegex(ValueError, error_msg):
+          ta.split([1.0, 2.0, 3.0], [1])
 
       ta = _make_ta(1, "baz")
-      if control_flow_util.ENABLE_CONTROL_FLOW_V2 and not in_eager_mode:
+      if not in_eager_mode:
         with self.assertRaisesRegex(
-            ValueError, "Shape must be at least rank 1 but is rank 0"):
-          self.evaluate(ta.split(1.0, [1]).flow)
+            ValueError, "Expected value to be at least a vector"
+        ):
+          ta.split(1.0, [1])
       else:
         with self.assertRaisesOpError(
             r"Expected value to be at least a vector, but received shape: \[\]"
@@ -630,6 +641,46 @@ class TensorArrayTest(test.TestCase):
             r"\(2 vs. 1\), and the TensorArray is not marked as "
             r"dynamically resizeable"):
           self.evaluate(ta.split([1.0], [1]).flow)
+
+  def testTensorArraySplitRejectsNegativeLengths(self):
+    if context.executing_eagerly():
+      self.skipTest("TensorArraySplitOp requires graph mode")
+
+    for lengths, index in [([-1, 1], 0), ([1, -1], 1)]:
+      with self.subTest(lengths=lengths), self.session():
+        handle, flow = gen_data_flow_ops.tensor_array_v3(
+            size=2, dtype=dtypes.float32, tensor_array_name="negative_lengths"
+        )
+        with self.assertRaisesOpError(
+            "Expected lengths to be non-negative, but found -1 at index "
+            f"{index}"
+        ):
+          self.evaluate(
+              gen_data_flow_ops.tensor_array_split_v3(
+                  handle=handle,
+                  value=constant_op.constant([], dtype=dtypes.float32),
+                  lengths=lengths,
+                  flow_in=flow,
+              )
+          )
+
+  def testTensorArraySplitRejectsOverflowingLengths(self):
+    if context.executing_eagerly():
+      self.skipTest("TensorArraySplitOp requires graph mode")
+
+    with self.session():
+      handle, flow = gen_data_flow_ops.tensor_array_v3(
+          size=2, dtype=dtypes.float32, tensor_array_name="overflowing_lengths"
+      )
+      with self.assertRaisesOpError("TensorArraySplit lengths overflowed"):
+        self.evaluate(
+            gen_data_flow_ops.tensor_array_split_v3(
+                handle=handle,
+                value=constant_op.constant([], dtype=dtypes.float32),
+                lengths=[np.iinfo(np.int64).max, 1],
+                flow_in=flow,
+            )
+        )
 
   def _testTensorArrayWriteGradientAddMultipleAdds(self, dtype):
     with self.cached_session():
@@ -979,14 +1030,14 @@ class TensorArrayTest(test.TestCase):
 
         def body(time, ta_t, state):
           sliced = array_ops.slice(
-              v0, begin=array_ops.stack([time, 0]), size=[1, -1])
+              v0, begin=array_ops_stack.stack([time, 0]), size=[1, -1])
           sliced = array_ops.squeeze(sliced)
           out = sliced + var + state
           state += sliced
           ta_t = ta_t.write(time, out)
           return (time + 1, ta_t, state)
 
-        (unused_0, h_final, unused_2) = control_flow_ops.while_loop(
+        (unused_0, h_final, unused_2) = while_loop.while_loop(
             cond=lambda time, unused_1, unused_2: time < 3,
             body=body,
             loop_vars=(time_0, ta, state0),
@@ -1079,20 +1130,20 @@ class TensorArrayTest(test.TestCase):
         c = lambda i, acc: i < 5
 
         def b(i, acc):
-          x1 = control_flow_ops.cond(
+          x1 = cond.cond(
               math_ops.equal(i, 0), lambda: x,
               lambda: math_ops.multiply(acc.read(i - 1), 2.0))
           return i + 1, acc.write(i, x1)
 
-        i1, acc1 = control_flow_ops.while_loop(c, b, [i, acc])
+        i1, acc1 = while_loop.while_loop(c, b, [i, acc])
 
         z = constant_op.constant(0.0)
 
         def fn(i, acc):
           return i + 1, acc.write(i, z)
 
-        _, acc2 = control_flow_ops.while_loop(lambda i, acc: i < num_steps, fn,
-                                              [i1, acc1])
+        _, acc2 = while_loop.while_loop(lambda i, acc: i < num_steps, fn,
+                                        [i1, acc1])
 
         r = acc2.stack()
         return r
@@ -1107,7 +1158,7 @@ class TensorArrayTest(test.TestCase):
   def testShapeAfterWhileLoop(self):
     size = 10
     ta = tensor_array_ops.TensorArray(dtype=dtypes.float32, size=size)
-    _, ta = control_flow_ops.while_loop(
+    _, ta = while_loop.while_loop(
         lambda i, _: i < size,
         lambda i, ta: (i + 1, ta.write(i, [[0.]])), [0, ta],
         parallel_iterations=1)
@@ -1324,6 +1375,30 @@ class TensorArrayTest(test.TestCase):
           self.assertEqual(
               tensor_shape.TensorShape(
                   ta1.handle.op.get_attr("element_shape")).ndims, None)
+
+  @test_util.deprecated_graph_mode_only
+  def testSplitStaticShapeMismatch(self):
+    with self.session():
+      ta = tensor_array_ops.TensorArray(
+          dtype=dtypes.float32, size=0, dynamic_size=True, infer_shape=True
+      )
+      value = constant_op.constant([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]])
+      with self.assertRaisesRegex(
+          ValueError,
+          r"Expected sum of lengths to be equal to values.shape\[0\]",
+      ):
+        ta.split(value, [1, 1])
+
+  @test_util.deprecated_graph_mode_only
+  def testSplitScalarValueDoesNotRaiseIndexError(self):
+    with self.session():
+      ta = tensor_array_ops.TensorArray(
+          dtype=dtypes.float32, size=0, dynamic_size=True, infer_shape=True
+      )
+      value = constant_op.constant(1.0)
+      with self.assertRaises((ValueError, errors.InvalidArgumentError)):
+        split = ta.split(value, [1])
+        self.evaluate(split.flow)
 
   @test_util.deprecated_graph_mode_only
   def testSkipEagerWriteUnknownShape(self):
@@ -1647,7 +1722,7 @@ class TensorArrayTest(test.TestCase):
       with ops.device("/job:worker/task:1/cpu:0"):
         return i + 1, ta_i.write(i, constant_op.constant(0.0))
 
-    _, ta_out = control_flow_ops.while_loop(
+    _, ta_out = while_loop.while_loop(
         lambda i, ta: i < 2, _body, loop_vars=[0, ta])
 
     session = session_lib.Session(self._workers[0].target)
@@ -1679,7 +1754,7 @@ class TensorArrayTest(test.TestCase):
       with ops.device("/job:worker/task:1/cpu:0"):
         return i + 1, ta_i.write(i, constant_op.constant(0.0))
 
-    _, ta_out = control_flow_ops.while_loop(
+    _, ta_out = while_loop.while_loop(
         lambda i, ta: i < 2, _body, loop_vars=[0, ta])
 
     session = session_lib.Session(self._workers[0].target)
@@ -1785,6 +1860,17 @@ class TensorArrayTest(test.TestCase):
       self.assertAllEqual(v0, -3)
       self.assertAllEqual(v1, 100)
 
+  @test_util.deprecated_graph_mode_only
+  def testTensorArrayScatterBfloat16GPU(self):
+    if not test.is_gpu_available():
+      return
+    with self.session(force_gpu=True) as sess:
+      ta = tensor_array_ops.TensorArray(
+          dtype=dtypes.bfloat16, tensor_array_name="foo", size=5)
+      ta = ta.scatter(
+          indices=[3, 4], value=array_ops.ones([2], dtype=dtypes.bfloat16))
+      self.assertAllEqual(ta.stack(), [0., 0., 0., 1., 1.])
+
   def testInferShapeFalseValid(self):
     ta = tensor_array_ops.TensorArray(
         dtypes.float32, size=3, infer_shape=False, element_shape=[None, 10, 20])
@@ -1833,13 +1919,29 @@ class TensorArrayTest(test.TestCase):
     ta = ta.write(0, [0])
     self.assertEqual([42, 1], ta.stack().shape.as_list())
 
+  def testTensorArrayConcatFailsWhenMissingStepContainer(self):
+    @def_function.function
+    def func():
+      y = data_flow_ops.TensorArrayConcatV2(
+          handle=["a", "b"],
+          flow_in=0.1,
+          dtype=dtypes.int32,
+          element_shape_except0=1,
+      )
+      return y
+
+    with self.assertRaisesRegex(
+        errors.NotFoundError, "Container .* does not exist"
+    ):
+      self.evaluate(func())
+
 
 class TensorArrayBenchmark(test.Benchmark):
 
   def _tensorArrayWriteInWhile(self):
     size = 10000
     ta = tensor_array_ops.TensorArray(dtype=dtypes.float32, size=size)
-    (_, ta) = control_flow_ops.while_loop(
+    (_, ta) = while_loop.while_loop(
         lambda i, _: i < size,
         lambda i, ta: (i + 1, ta.write(i, 0.)), [0, ta],
         parallel_iterations=1)

@@ -15,11 +15,13 @@
 """Tests for DecodeRaw op from parsing_ops."""
 
 import gzip
+import io
 import zlib
 
-from six import BytesIO
+import zstandard as zstd
 
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import parsing_ops
@@ -33,15 +35,17 @@ class DecodeCompressedOpTest(test.TestCase):
       return bytes_in
     elif compression_type == "ZLIB":
       return zlib.compress(bytes_in)
+    elif compression_type == "ZSTD":
+      return zstd.compress(bytes_in)
     else:
-      out = BytesIO()
+      out = io.BytesIO()
       with gzip.GzipFile(fileobj=out, mode="wb") as f:
         f.write(bytes_in)
       return out.getvalue()
 
   def testDecompressShapeInference(self):
     with ops.Graph().as_default():
-      for compression_type in ["ZLIB", "GZIP", ""]:
+      for compression_type in ["ZLIB", "GZIP", "ZSTD", ""]:
         with self.cached_session():
           in_bytes = array_ops.placeholder(dtypes.string, shape=[2])
           decompressed = parsing_ops.decode_compressed(
@@ -49,7 +53,7 @@ class DecodeCompressedOpTest(test.TestCase):
           self.assertEqual([2], decompressed.get_shape().as_list())
 
   def testDecompress(self):
-    for compression_type in ["ZLIB", "GZIP", ""]:
+    for compression_type in ["ZLIB", "GZIP", "ZSTD", ""]:
       with self.cached_session():
 
         def decode(in_bytes, compression_type=compression_type):
@@ -62,7 +66,7 @@ class DecodeCompressedOpTest(test.TestCase):
         self.assertAllEqual([b"AaAA", b"bBbb"], result)
 
   def testDecompressWithRaw(self):
-    for compression_type in ["ZLIB", "GZIP", ""]:
+    for compression_type in ["ZLIB", "GZIP", "ZSTD", ""]:
       with self.cached_session():
 
         def decode(in_bytes, compression_type=compression_type):
@@ -75,6 +79,98 @@ class DecodeCompressedOpTest(test.TestCase):
 
         self.assertAllEqual(
             [[ord("A") + ord("a") * 256, ord("B") + ord("C") * 256]], result)
+
+  def testDecompressZlibAtLimitIsAccepted(self):
+    # A ZLIB stream that decompresses to EXACTLY 1GB must be accepted,
+    # not rejected - the boundary case dmiltr3 flagged in review.
+    #
+    # level=1 (fastest): compressing 1GB of zeros at the default level takes
+    # several seconds of CPU per test; the compression ratio on this
+    # all-zeros input is unaffected, only the compressor's own runtime is.
+    kOneGb = 1024 * 1024 * 1024
+    chunk = b"\x00" * (1024 * 1024)  # 1 MB
+    compressor = zlib.compressobj(level=1)
+    compressed = b"".join(
+        compressor.compress(chunk) for _ in range(1024)  # 1024 * 1MB = 1GB
+    )
+    compressed += compressor.flush()
+
+    with self.cached_session():
+      result = self.evaluate(
+          parsing_ops.decode_compressed(compressed, compression_type="ZLIB")
+      )
+      self.assertLen(result, kOneGb)
+
+  def testDecompressGzipAtLimitIsAccepted(self):
+    # A GZIP stream that decompresses to EXACTLY 1GB must be accepted.
+    kOneGb = 1024 * 1024 * 1024
+    chunk = b"\x00" * (1024 * 1024)  # 1 MB
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", compresslevel=1) as f:
+      for _ in range(1024):  # 1024 * 1MB = 1GB
+        f.write(chunk)
+    compressed = out.getvalue()
+
+    with self.cached_session():
+      result = self.evaluate(
+          parsing_ops.decode_compressed(compressed, compression_type="GZIP")
+      )
+      self.assertLen(result, kOneGb)
+
+  def testDecompressLargeZlibSize(self):
+    # A ZLIB stream that decompresses to > 1GB must be rejected.
+    chunk = b"\x00" * (1024 * 1024)  # 1 MB
+    compressor = zlib.compressobj(level=1)
+    compressed = b"".join(
+        compressor.compress(chunk) for _ in range(1024)  # 1024 * 1MB = 1GB
+    )
+    compressed += compressor.compress(b"\x00")  # +1 byte over the limit
+    compressed += compressor.flush()
+
+    with self.cached_session():
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, "Decompressed size exceeds 1GB limit"
+      ):
+        self.evaluate(
+            parsing_ops.decode_compressed(compressed, compression_type="ZLIB")
+        )
+
+  def testDecompressLargeGzipSize(self):
+    # Same as testDecompressLargeZlibSize but for GZIP framing.
+    chunk = b"\x00" * (1024 * 1024)  # 1 MB
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", compresslevel=1) as f:
+      for _ in range(1024):  # 1024 * 1MB = 1GB
+        f.write(chunk)
+      f.write(b"\x00")  # +1 byte over the limit
+    compressed = out.getvalue()
+
+    with self.cached_session():
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, "Decompressed size exceeds 1GB limit"
+      ):
+        self.evaluate(
+            parsing_ops.decode_compressed(compressed, compression_type="GZIP")
+        )
+
+  def testDecompressLargeZstdSize(self):
+    # Construct a ZSTD frame header specifying a 2GB uncompressed size.
+    # Magic Number (4 bytes): \x28\xb5\x2f\xfd
+    # Frame_Header_Descriptor (1 byte): \xe0
+    # Frame_Content_Size (8B): 2GB = 2147483648
+    # = \x00\x00\x00\x80\x00\x00\x00\x00
+    invalid_zstd_header = (
+        b"\x28\xb5\x2f\xfd\xe0\x00\x00\x00\x80\x00\x00\x00\x00"
+    )
+    with self.cached_session():
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, "Decompressed size exceeds 1GB limit"
+      ):
+        self.evaluate(
+            parsing_ops.decode_compressed(
+                invalid_zstd_header, compression_type="ZSTD"
+            )
+        )
 
 
 if __name__ == "__main__":

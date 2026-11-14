@@ -22,7 +22,6 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "tensorflow/lite/delegates/gpu/common/operations.h"
@@ -111,6 +110,7 @@ class Registry : public NodeShader {
     insert_elementwise_op(Type::FLOOR);
     insert_elementwise_op(Type::FLOOR_DIV);
     insert_elementwise_op(Type::FLOOR_MOD);
+    insert_elementwise_op(Type::GELU);
     insert_elementwise_op(Type::HARD_SWISH);
     insert_elementwise_op(Type::LOG);
     insert_elementwise_op(Type::NEG);
@@ -160,7 +160,7 @@ class Registry : public NodeShader {
 }  // namespace
 
 std::unique_ptr<NodeShader> NewNodeShaderRegistry() {
-  return absl::make_unique<Registry>();
+  return std::make_unique<Registry>();
 }
 
 }  // namespace gl

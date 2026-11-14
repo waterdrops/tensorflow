@@ -18,6 +18,7 @@ import numpy as np
 
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gradient_checker
@@ -157,6 +158,35 @@ class AtrousConv2DTest(test.TestCase):
         err_tolerance = 4e-3 if test_util.is_xla_enabled() else 1e-3
         self.assertLess(err, err_tolerance)
 
+  @test_util.run_deprecated_v1
+  def testAtrousConv2DInvalid(self):
+    with self.session():
+      with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+        op = nn_ops.atrous_conv2d(
+            value=np.ones((1, 1, 1, 5)),
+            filters=np.ones((1, 1, 5, 1)),
+            rate=2147483647,
+            padding="SAME")
+        self.evaluate(op)
+
+  def testAtrousConv2DInvalidInputRank(self):
+    with self.assertRaisesRegex(ValueError, "rank 4"):
+      nn_ops.atrous_conv2d(
+          value=np.ones([10]),
+          filters=np.ones([1, 1, 1, 1]),
+          rate=1,
+          padding="SAME",
+      )
+
+  def testAtrousConv2DInvalidFilterRank(self):
+    with self.assertRaisesRegex(ValueError, "rank 4"):
+      nn_ops.atrous_conv2d(
+          value=np.ones([1, 1, 1, 1]),
+          filters=np.ones([10]),
+          rate=1,
+          padding="SAME",
+      )
+
 
 class AtrousConv2DTransposeTest(test.TestCase):
 
@@ -196,6 +226,17 @@ class AtrousConv2DTransposeTest(test.TestCase):
                     x, f_up, y_shape, strides=[1, 1, 1, 1], padding=padding)
                 self.assertAllClose(y1, y2, rtol=1e-3, atol=1e-3)
 
+  def testAtrousConv2DTransposeInvalid(self):
+    with self.session():
+      with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+        op = nn_ops.atrous_conv2d_transpose(
+            value=np.ones((10, 1, 1, 1)),
+            filters=np.ones((1, 1, 1, 1)),
+            rate=1356819205,
+            padding="SAME",
+            output_shape=[1, 1, 1, 1])
+        self.evaluate(op)
+
 
 class AtrousDepthwiseConv2DTest(test.TestCase):
 
@@ -223,6 +264,12 @@ class AtrousDepthwiseConv2DTest(test.TestCase):
                     x, f, strides, padding, rate=[rate, rate])
                 y2 = nn_impl.depthwise_conv2d(x, f_up, strides, padding)
                 self.assertAllClose(y1, y2, rtol=1e-3, atol=1e-3)
+
+  def testInvalidInputRank(self):
+    value = array_ops.zeros([10], dtype=dtypes.float32)
+    filters = array_ops.zeros([5, 5, 1, 8], dtype=dtypes.float32)
+    with self.assertRaisesRegex(ValueError, "rank 4"):
+      nn_ops.atrous_conv2d(value, filters, rate=1, padding="VALID")
 
 
 if __name__ == "__main__":

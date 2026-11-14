@@ -18,8 +18,10 @@ import numpy as np
 
 from tensorflow.python.client import session
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import errors_impl
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
+from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import gen_linalg_ops
 from tensorflow.python.ops import linalg_ops
@@ -31,24 +33,29 @@ from tensorflow.python.platform import test
 
 class DeterminantOpTest(test.TestCase):
 
-  def _compareDeterminantBase(self, matrix_x, tf_ans):
+  def _compareDeterminantBase(self, matrix_x, tf_ans, expected=None):
     out = self.evaluate(tf_ans)
     shape = matrix_x.shape
     if shape[-1] == 0 and shape[-2] == 0:
       np_ans = np.ones(shape[:-2]).astype(matrix_x.dtype)
-    else:
+    elif expected is None:
       np_ans = np.array(np.linalg.det(matrix_x)).astype(matrix_x.dtype)
+    else:
+      np_ans = expected
     self.assertShapeEqual(np_ans, tf_ans)
     self.assertAllClose(np_ans, out, atol=5e-5)
 
-  def _compareLogDeterminantBase(self, matrix_x, tf_ans):
+  def _compareLogDeterminantBase(self, matrix_x, tf_ans, expected=None):
     sign_tf, abs_log_det_tf = tf_ans
     shape = matrix_x.shape
     if shape[-1] == 0 or shape[-2] == 0:
       np_sign, np_ans = (1.0, np.zeros(shape[:-2]).astype(matrix_x.dtype))
-    else:
+    elif expected is None:
       np_sign, np_ans = np.linalg.slogdet(matrix_x)
       np_ans = np_ans.astype(matrix_x.dtype)
+    else:
+      np_ans = np.log(np.abs(expected))
+      np_sign = np.sign(expected)
 
     self.assertShapeEqual(np_ans, abs_log_det_tf)
     sign_tf_val = self.evaluate(sign_tf)
@@ -58,12 +65,14 @@ class DeterminantOpTest(test.TestCase):
         np_sign * np.exp(np_ans),
         atol=5e-5)
 
-  def _compareDeterminant(self, matrix_x):
+  def _compareDeterminant(self, matrix_x, expected=None):
     with test_util.use_gpu():
-      self._compareDeterminantBase(matrix_x,
-                                   linalg_ops.matrix_determinant(matrix_x))
+      self._compareDeterminantBase(
+          matrix_x, linalg_ops.matrix_determinant(matrix_x), expected
+      )
       self._compareLogDeterminantBase(
-          matrix_x, gen_linalg_ops.log_matrix_determinant(matrix_x))
+          matrix_x, gen_linalg_ops.log_matrix_determinant(matrix_x), expected
+      )
 
   def testBasic(self):
     # 2x2 matrices
@@ -76,6 +85,27 @@ class DeterminantOpTest(test.TestCase):
         ], [1., 6., 7., 4., 7.], [2., 3., 4., 5., 6.]]).astype(np.float32))
     # A multidimensional batch of 2x2 matrices
     self._compareDeterminant(np.random.rand(3, 4, 5, 2, 2).astype(np.float32))
+
+  def testSingularMatrix(self):
+    for dtype in (np.float32, np.float64, np.complex64, np.complex128):
+      for matrix_values in (
+          [[1.0, 2.0], [2.0, 4.0]],
+          [[0.0, 1.0, 2.0], [0.0, 3.0, 4.0], [0.0, 5.0, 6.0]],
+          [[1.0, 0.0, -1.0], [-1.0, 1.0, 0.0], [0.0, -1.0, 1.0]],
+          [
+              [[1.0, 2.0], [2.0, 4.0]],
+              [[0.0, 0.0], [0.0, 0.0]],
+          ],
+      ):
+        matrix = np.array(matrix_values, dtype=dtype)
+        with test_util.use_gpu():
+          det = self.evaluate(linalg_ops.matrix_determinant(matrix))
+          sign, log_det = self.evaluate(
+              gen_linalg_ops.log_matrix_determinant(matrix)
+          )
+          self.assertAllClose(det, np.zeros_like(det))
+          self.assertAllClose(sign, np.zeros_like(sign))
+          self.assertTrue(np.all(np.isneginf(log_det.real)))
 
   def testBasicDouble(self):
     # 2x2 matrices
@@ -144,6 +174,28 @@ class DeterminantOpTest(test.TestCase):
     with self.assertRaises(ValueError):
       linalg_ops.matrix_determinant(tensor1)
 
+  @test_util.run_in_graph_and_eager_modes(use_gpu=True)
+  def testInvalidRank(self):
+    for fn in (
+        linalg_ops.matrix_determinant,
+        gen_linalg_ops.matrix_determinant,
+        gen_linalg_ops.log_matrix_determinant,
+    ):
+      for bad_shape in ([], [2]):
+        for dtype in (np.float32, np.float64, np.complex64, np.complex128):
+          val = constant_op.constant(np.zeros(bad_shape, dtype=dtype))
+          with self.assertRaises(
+              (ValueError, errors_impl.InvalidArgumentError)
+          ):
+            with test_util.use_gpu():
+              self.evaluate(fn(val))
+          val_dyn = array_ops.placeholder_with_default(val, shape=None)
+          with self.assertRaises(
+              (ValueError, errors_impl.InvalidArgumentError)
+          ):
+            with test_util.use_gpu():
+              self.evaluate(fn(val_dyn))
+
   def testEmpty(self):
     self._compareDeterminant(np.empty([0, 2, 2]))
     self._compareDeterminant(np.empty([2, 0, 0]))
@@ -157,6 +209,46 @@ class DeterminantOpTest(test.TestCase):
       det2 = linalg_ops.matrix_determinant(matrix2)
       det1_val, det2_val = self.evaluate([det1, det2])
       self.assertEqual(det1_val, det2_val)
+
+  def testInfAndNans(self):
+    # 2x2 matrices
+    np_inf = np.float64(np.inf)
+    np_nan = np.float64(np.nan)
+    self._compareDeterminant(
+        np.array([[np.inf, 1], [1, 1]]).astype(np.float32), expected=np_inf
+    )
+    self._compareDeterminant(
+        np.array([[np.inf, np.inf], [1, 1]]).astype(np.float32), expected=np_nan
+    )
+    self._compareDeterminant(
+        np.array([[np.inf, -np.inf], [1, 1]]).astype(np.float32),
+        expected=np_nan,
+    )
+    self._compareDeterminant(
+        np.array([[np.nan, 1], [1, 1]]).astype(np.float32), expected=np_nan
+    )
+
+    # 5x5 matrices (Eigen forces LU decomposition)
+    self._compareDeterminant(
+        np.array([
+            [np.inf, 3.0, 4.0, 5.0, 6.0],
+            [3.0, 4.0, 9.0, 2.0, 0.0],
+            [2.0, 5.0, 8.0, 3.0, 8.0],
+            [1.0, 6.0, 7.0, 4.0, 7.0],
+            [2.0, 3.0, 4.0, 5.0, 6.0],
+        ]).astype(np.float32),
+        expected=-np_inf,
+    )
+    self._compareDeterminant(
+        np.array([
+            [np.nan, 3.0, 4.0, 5.0, 6.0],
+            [3.0, 4.0, 9.0, 2.0, 0.0],
+            [2.0, 5.0, 8.0, 3.0, 8.0],
+            [1.0, 6.0, 7.0, 4.0, 7.0],
+            [2.0, 3.0, 4.0, 5.0, 6.0],
+        ]).astype(np.float32),
+        expected=np_nan,
+    )
 
 
 class MatrixDeterminantBenchmark(test.Benchmark):

@@ -18,210 +18,49 @@ limitations under the License.
 #include <stdint.h>
 
 #include <algorithm>
-#include <limits>
 
 #include "ruy/profiler/instrumentation.h"  // from @ruy
 #include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/compatibility.h"
+#include "tensorflow/lite/kernels/internal/reference/broadcast_loop.h"
 #include "tensorflow/lite/kernels/internal/types.h"
 
 namespace tflite {
 
 namespace reference_ops {
 
-inline void SubNonBroadcast(const ArithmeticParams& params,
-                            const RuntimeShape& input1_shape,
-                            const float* input1_data,
-                            const RuntimeShape& input2_shape,
-                            const float* input2_data,
-                            const RuntimeShape& output_shape,
-                            float* output_data) {
-  const int flat_size =
-      MatchingElementsSize(input1_shape, input2_shape, output_shape);
-  for (int i = 0; i < flat_size; ++i) {
-    output_data[i] = ActivationFunctionWithMinMax(
-        input1_data[i] - input2_data[i], params.float_activation_min,
-        params.float_activation_max);
-  }
-}
-
-inline void SubNonBroadcast(const ArithmeticParams& params,
-                            const RuntimeShape& input1_shape,
-                            const int32_t* input1_data,
-                            const RuntimeShape& input2_shape,
-                            const int32_t* input2_data,
-                            const RuntimeShape& output_shape,
-                            int32_t* output_data) {
-  const int flat_size =
-      MatchingElementsSize(input1_shape, input2_shape, output_shape);
-  for (int i = 0; i < flat_size; ++i) {
-    output_data[i] = ActivationFunctionWithMinMax(
-        input1_data[i] - input2_data[i], params.quantized_activation_min,
-        params.quantized_activation_max);
-  }
-}
-
-// TODO(b/151345304): We can implement BroadcastSub on buffers of arbitrary
-// dimensionality if the runtime code does a single loop over one dimension
-// that handles broadcasting as the base case. The code generator would then
-// generate max(D1, D2) nested for loops.
-template <int N = 5>
-inline void BroadcastSubSlow(const ArithmeticParams& params,
-                             const RuntimeShape& input1_shape,
-                             const float* input1_data,
-                             const RuntimeShape& input2_shape,
-                             const float* input2_data,
-                             const RuntimeShape& output_shape,
-                             float* output_data) {
-  ruy::profiler::ScopeLabel label("BroadcastSubSlow/float");
-  TFLITE_DCHECK_LE(input1_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(input2_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(output_shape.DimensionsCount(), N);
-  NdArrayDesc<N> desc1;
-  NdArrayDesc<N> desc2;
-  NdArrayDesc<N> output_desc;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  CopyDimsToDesc(RuntimeShape::ExtendedShape(N, output_shape), &output_desc);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  auto sub_func = [&](int indexes[N]) {
-    output_data[SubscriptToIndex(output_desc, indexes)] =
-        ActivationFunctionWithMinMax(
-            input1_data[SubscriptToIndex(desc1, indexes)] -
-                input2_data[SubscriptToIndex(desc2, indexes)],
-            params.float_activation_min, params.float_activation_max);
+template <typename T, typename F>
+inline void BroadcastSubCommon(const ArithmeticParams& params,
+                               const RuntimeShape& input1_shape,
+                               const T* input1_data,
+                               const RuntimeShape& input2_shape,
+                               const T* input2_data,
+                               const RuntimeShape& output_shape, T* output_data,
+                               F binary_func) {
+  auto op = [&params, binary_func](T a, T b) {
+    return binary_func(a, b, params);
   };
-  NDOpsHelper<N>(output_desc, sub_func);
+  BroadcastBinaryOpSimple(input1_shape, input1_data, input2_shape, input2_data,
+                          output_shape, output_data, op);
 }
 
-template <int N = 5>
-inline void BroadcastSubSlow(const ArithmeticParams& params,
-                             const RuntimeShape& input1_shape,
-                             const int32_t* input1_data,
-                             const RuntimeShape& input2_shape,
-                             const int32_t* input2_data,
-                             const RuntimeShape& output_shape,
-                             int32_t* output_data) {
-  ruy::profiler::ScopeLabel label("BroadcastSubSlow/int32_t");
-  TFLITE_DCHECK_LE(input1_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(input2_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(output_shape.DimensionsCount(), N);
-  NdArrayDesc<N> desc1;
-  NdArrayDesc<N> desc2;
-  NdArrayDesc<N> output_desc;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  CopyDimsToDesc(RuntimeShape::ExtendedShape(N, output_shape), &output_desc);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  auto sub_func = [&](int indexes[N]) {
-    output_data[SubscriptToIndex(output_desc, indexes)] =
-        ActivationFunctionWithMinMax(
-            input1_data[SubscriptToIndex(desc1, indexes)] -
-                input2_data[SubscriptToIndex(desc2, indexes)],
-            params.quantized_activation_min, params.quantized_activation_max);
-  };
-  NDOpsHelper<N>(output_desc, sub_func);
-}
-
-template <int N = 5>
-void BroadcastSubSlow(const ArithmeticParams& params,
-                      const RuntimeShape& input1_shape,
-                      const int64_t* input1_data,
-                      const RuntimeShape& input2_shape,
-                      const int64_t* input2_data,
-                      const RuntimeShape& output_shape, int64_t* output_data) {
-  ruy::profiler::ScopeLabel label("BroadcastSubSlow/int64_t");
-  TFLITE_DCHECK_LE(input1_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(input2_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(output_shape.DimensionsCount(), N);
-  NdArrayDesc<N> desc1;
-  NdArrayDesc<N> desc2;
-  NdArrayDesc<N> output_desc;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  CopyDimsToDesc(RuntimeShape::ExtendedShape(N, output_shape), &output_desc);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  auto sub_func = [&](int indexes[N]) {
-    output_data[SubscriptToIndex(output_desc, indexes)] =
-        ActivationFunctionWithMinMax(
-            input1_data[SubscriptToIndex(desc1, indexes)] -
-                input2_data[SubscriptToIndex(desc2, indexes)],
-            params.int64_activation_min, params.int64_activation_max);
-  };
-  NDOpsHelper<N>(output_desc, sub_func);
-}
-
-template <typename T, int N = 5>
+template <typename T>
 void BroadcastSubSlow(const ArithmeticParams& params,
                       const RuntimeShape& input1_shape, const T* input1_data,
                       const RuntimeShape& input2_shape, const T* input2_data,
                       const RuntimeShape& output_shape, T* output_data) {
-  ruy::profiler::ScopeLabel label("BroadcastSubSlow/templated");
-  TFLITE_DCHECK_LE(input1_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(input2_shape.DimensionsCount(), N);
-  TFLITE_DCHECK_LE(output_shape.DimensionsCount(), N);
-  NdArrayDesc<N> desc1;
-  NdArrayDesc<N> desc2;
-  NdArrayDesc<N> output_desc;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  CopyDimsToDesc(RuntimeShape::ExtendedShape(N, output_shape), &output_desc);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  auto sub_func = [&](int indexes[N]) {
-    output_data[SubscriptToIndex(output_desc, indexes)] =
-        ActivationFunctionWithMinMax(
-            input1_data[SubscriptToIndex(desc1, indexes)] -
-                input2_data[SubscriptToIndex(desc2, indexes)],
-            params.quantized_activation_min, params.quantized_activation_max);
-  };
-  NDOpsHelper<N>(output_desc, sub_func);
+  ruy::profiler::ScopeLabel label("BroadcastSubSlow/T");
+  BroadcastSubCommon<T>(
+      params, input1_shape, input1_data, input2_shape, input2_data,
+      output_shape, output_data,
+      [](T input1_val, T input2_val, const ArithmeticParams& params) {
+        T activation_min, activation_max;
+        GetActivationParams(params, &activation_min, &activation_max);
+        return ActivationFunctionWithMinMax(input1_val - input2_val,
+                                            activation_min, activation_max);
+      });
 }
 
-template <int N = 5>
 inline void BroadcastSub16POTSlow(const ArithmeticParams& params,
                                   const RuntimeShape& input1_shape,
                                   const int16_t* input1_data,
@@ -230,42 +69,24 @@ inline void BroadcastSub16POTSlow(const ArithmeticParams& params,
                                   const RuntimeShape& output_shape,
                                   int16_t* output_data) {
   ruy::profiler::ScopeLabel label("BroadcastSub16POTSlow/int16_t");
-  NdArrayDesc<N> desc1;
-  NdArrayDesc<N> desc2;
-  NdArrayDesc<N> output_desc;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  CopyDimsToDesc(RuntimeShape::ExtendedShape(N, output_shape), &output_desc);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  auto sub_func = [&](int indexes[N]) {
-    const int32_t input1_val = input1_data[SubscriptToIndex(desc1, indexes)];
-    const int32_t input2_val = input2_data[SubscriptToIndex(desc2, indexes)];
-    const int32_t scaled_input1_val =
-        gemmlowp::RoundingDivideByPOT(input1_val, -params.input1_shift);
-    const int32_t scaled_input2_val =
-        gemmlowp::RoundingDivideByPOT(input2_val, -params.input2_shift);
-    const int32_t raw_output = scaled_input1_val - scaled_input2_val;
-    const int32_t clamped_output =
-        std::min(params.quantized_activation_max,
-                 std::max(params.quantized_activation_min, raw_output));
-    output_data[SubscriptToIndex(output_desc, indexes)] =
-        static_cast<int16_t>(clamped_output);
-  };
-  NDOpsHelper<N>(output_desc, sub_func);
+  BroadcastSubCommon<int16_t>(
+      params, input1_shape, input1_data, input2_shape, input2_data,
+      output_shape, output_data,
+      [](int16_t input1_val, int16_t input2_val,
+         const ArithmeticParams& params) {
+        const int32_t scaled_input1_val =
+            gemmlowp::RoundingDivideByPOT(input1_val, -params.input1_shift);
+        const int32_t scaled_input2_val =
+            gemmlowp::RoundingDivideByPOT(input2_val, -params.input2_shift);
+        const int32_t raw_output = scaled_input1_val - scaled_input2_val;
+        const int32_t clamped_output =
+            std::min(params.quantized_activation_max,
+                     std::max(params.quantized_activation_min, raw_output));
+        return static_cast<int16_t>(clamped_output);
+      });
 }
 
-template <typename T, int N = 5>
+template <typename T>
 void BroadcastQuantSubSlow(const ArithmeticParams& params,
                            const RuntimeShape& input1_shape,
                            const T* input1_data,
@@ -273,49 +94,32 @@ void BroadcastQuantSubSlow(const ArithmeticParams& params,
                            const T* input2_data,
                            const RuntimeShape& output_shape, T* output_data) {
   ruy::profiler::ScopeLabel label("BroadcastQuantSubSlow/T");
-  NdArrayDesc<N> desc1;
-  NdArrayDesc<N> desc2;
-  NdArrayDesc<N> output_desc;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  CopyDimsToDesc(RuntimeShape::ExtendedShape(N, output_shape), &output_desc);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  auto sub_func = [&](int indexes[N]) {
-    const int32_t input1_val =
-        params.input1_offset + input1_data[SubscriptToIndex(desc1, indexes)];
-    const int32_t input2_val =
-        params.input2_offset + input2_data[SubscriptToIndex(desc2, indexes)];
-    const int32_t shifted_input1_val = input1_val * (1 << params.left_shift);
-    const int32_t shifted_input2_val = input2_val * (1 << params.left_shift);
-    const int32_t scaled_input1_val =
-        MultiplyByQuantizedMultiplierSmallerThanOneExp(
-            shifted_input1_val, params.input1_multiplier, params.input1_shift);
-    const int32_t scaled_input2_val =
-        MultiplyByQuantizedMultiplierSmallerThanOneExp(
-            shifted_input2_val, params.input2_multiplier, params.input2_shift);
-    const int32_t raw_sub = scaled_input1_val - scaled_input2_val;
-    const int32_t raw_output =
-        MultiplyByQuantizedMultiplierSmallerThanOneExp(
-            raw_sub, params.output_multiplier, params.output_shift) +
-        params.output_offset;
-    const int32_t clamped_output =
-        std::min(params.quantized_activation_max,
-                 std::max(params.quantized_activation_min, raw_output));
-    output_data[SubscriptToIndex(output_desc, indexes)] =
-        static_cast<T>(clamped_output);
-  };
-  NDOpsHelper<N>(output_desc, sub_func);
+  BroadcastSubCommon<T>(
+      params, input1_shape, input1_data, input2_shape, input2_data,
+      output_shape, output_data,
+      [](T input1_val, T input2_val, const ArithmeticParams& params) {
+        const int32_t shifted_input1_val =
+            (params.input1_offset + input1_val) * (1 << params.left_shift);
+        const int32_t shifted_input2_val =
+            (params.input2_offset + input2_val) * (1 << params.left_shift);
+        const int32_t scaled_input1_val =
+            MultiplyByQuantizedMultiplierSmallerThanOneExp(
+                shifted_input1_val, params.input1_multiplier,
+                params.input1_shift);
+        const int32_t scaled_input2_val =
+            MultiplyByQuantizedMultiplierSmallerThanOneExp(
+                shifted_input2_val, params.input2_multiplier,
+                params.input2_shift);
+        const int32_t raw_sub = scaled_input1_val - scaled_input2_val;
+        const int32_t raw_output =
+            MultiplyByQuantizedMultiplierSmallerThanOneExp(
+                raw_sub, params.output_multiplier, params.output_shift) +
+            params.output_offset;
+        const int32_t clamped_output =
+            std::min(params.quantized_activation_max,
+                     std::max(params.quantized_activation_min, raw_output));
+        return static_cast<T>(clamped_output);
+      });
 }
 
 // Element-wise add that can often be used for inner loop of broadcast add as
@@ -402,35 +206,12 @@ void Sub(const ArithmeticParams& params, const RuntimeShape& input1_shape,
          const T* input1_data, const RuntimeShape& input2_shape,
          const T* input2_data, const RuntimeShape& output_shape,
          T* output_data) {
-  NdArrayDesc<4> desc1;
-  NdArrayDesc<4> desc2;
-  NdArrayDescsForElementwiseBroadcast(input1_shape, input2_shape, &desc1,
-                                      &desc2);
-  const RuntimeShape extended_output_shape =
-      RuntimeShape::ExtendedShape(4, output_shape);
-
-  // In Tensorflow, the dimensions are canonically named (batch_number, row,
-  // col, channel), with extents (batches, height, width, depth), with the
-  // trailing dimension changing most rapidly (channels has the smallest stride,
-  // typically 1 element).
-  //
-  // In generated C code, we store arrays with the dimensions reversed. The
-  // first dimension has smallest stride.
-  //
-  // We name our variables by their Tensorflow convention, but generate C code
-  // nesting loops such that the innermost loop has the smallest stride for the
-  // best cache behavior.
-  for (int b = 0; b < extended_output_shape.Dims(0); ++b) {
-    for (int y = 0; y < extended_output_shape.Dims(1); ++y) {
-      for (int x = 0; x < extended_output_shape.Dims(2); ++x) {
-        for (int c = 0; c < extended_output_shape.Dims(3); ++c) {
-          output_data[Offset(extended_output_shape, b, y, x, c)] =
-              input1_data[SubscriptToIndex(desc1, b, y, x, c)] -
-              input2_data[SubscriptToIndex(desc2, b, y, x, c)];
-        }
-      }
-    }
-  }
+  BroadcastSubCommon<T>(
+      params, input1_shape, input1_data, input2_shape, input2_data,
+      output_shape, output_data,
+      [](T input1_val, T input2_val, const ArithmeticParams& params) {
+        return input1_val - input2_val;
+      });
 }
 
 inline void SetActivationMinMax(const ArithmeticParams& params,

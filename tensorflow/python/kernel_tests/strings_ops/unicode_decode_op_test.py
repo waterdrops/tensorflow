@@ -249,21 +249,46 @@ class UnicodeDecodeTest(test_util.TensorFlowTestCase,
                     [ord('='), ord('='), ord('='), ord('=')],
                     [ord('w'), ord('o'), ord('r'), ord('l'), ord('d')]]),
       dict(
-          input=[b"\x00", b"hello", b"==\x01==", b"world"],
+          input=[b"\x00", b"hello", b"==\x01==", b"world",
+                 # C1 control characters are not replaced.
+                 u"\x80\x9f".encode()],
           input_encoding="UTF-8",
           replace_control_characters=True,
           expected=[[0xFFFD],
                     [ord('h'), ord('e'), ord('l'), ord('l'), ord('o')],
                     [61, 61, 65533, 61, 61],
-                    [ord('w'), ord('o'), ord('r'), ord('l'), ord('d')]]),
+                    [ord('w'), ord('o'), ord('r'), ord('l'), ord('d')],
+                    [0x80, 0x9F]]),
       dict(
-          input=[b"\x00", b"hello", b"==\x01==", b"world"],
+          input=[b"\x00", b"hello", b"==\x01==", b"world",
+                 u"\u0080\u009f".encode()],
           input_encoding="UTF-8",
           replace_control_characters=True,
           replacement_char=0,
           expected=[[0], [ord('h'), ord('e'), ord('l'), ord('l'), ord('o')],
                     [ord('='), ord('='), 0, ord('='), ord('=')],
-                    [ord('w'), ord('o'), ord('r'), ord('l'), ord('d')]]),
+                    [ord('w'), ord('o'), ord('r'), ord('l'), ord('d')],
+                    [0x80, 0x9F]]),
+      dict(
+          input=[b"\xed\xa0\xbd",  # single high surrogate
+                 b"\xed\xb8\x80",  # single low surrogate
+                 b"\xed\xa0\xbd\xed\xb8\x80"],  # surrogate pair
+          input_encoding="UTF-8",
+          expected=[[0xFFFD, 0xFFFD, 0xFFFD],
+                    [0xFFFD, 0xFFFD, 0xFFFD],
+                    [0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD]]),
+      dict(
+          input=["\ufdd0".encode(),  # noncharacter
+                 "\ufffe\uffff".encode(),  # last two in BMP
+                 "\U0010ffff".encode(),  # last in plane 16 = last in Unicode
+                 b"\xc0\x80",  # overlong U+0000 encoding
+                 b"\xf4\x90\x80\x80"],  # U+110000, beyond Unicode
+          input_encoding="UTF-8",
+          expected=[[0xFDD0],
+                    [0xFFFE, 0xFFFF],
+                    [0x10FFFF],
+                    [0xFFFD] * 2,
+                    [0xFFFD] * 4]),
   ])  # pyformat: disable
   def testErrorModes(self, expected=None, **args):
     result = ragged_string_ops.unicode_decode(**args)
@@ -437,6 +462,24 @@ class UnicodeDecodeTest(test_util.TensorFlowTestCase,
     self.assertAllEqual(expected_char_values, result.char_values)
     self.assertAllEqual(expected_char_to_byte_starts,
                         result.char_to_byte_starts)
+
+  def testDecodeWithOffsetsInt32Splits(self):
+    """Verifies that Tsplits=dtypes.int32 processes correctly without type mismatch."""
+    input_data = constant_op.constant([b"hello", b"world"], dtype=dtypes.string)
+
+    result = gen_string_ops.unicode_decode_with_offsets(
+        input=input_data, input_encoding="UTF-8", Tsplits=dtypes.int32
+    )
+
+    self.assertEqual(result.row_splits.dtype, dtypes.int32)
+    self.assertEqual(result.char_to_byte_starts.dtype, dtypes.int64)
+    self.assertAllEqual(result.row_splits, [0, 5, 10])
+    self.assertAllEqual(
+        result.char_values, [104, 101, 108, 108, 111, 119, 111, 114, 108, 100]
+    )
+    self.assertAllEqual(
+        result.char_to_byte_starts, [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+    )
 
 
 @test_util.run_all_in_graph_and_eager_modes

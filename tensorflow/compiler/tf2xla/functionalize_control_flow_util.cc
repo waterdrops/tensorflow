@@ -30,7 +30,7 @@ bool NodeCmpByNameResourcesLast::operator()(const Node* lhs,
          std::tie(rhs_is_resource, rhs->name());
 }
 
-StatusOr<Node*> BuildRetvalNode(Graph* graph, DataType type, int index) {
+absl::StatusOr<Node*> BuildRetvalNode(Graph* graph, DataType type, int index) {
   const char* const kRetValOp = "_Retval";
   NodeDef ret_def;
   ret_def.set_op(kRetValOp);
@@ -40,9 +40,9 @@ StatusOr<Node*> BuildRetvalNode(Graph* graph, DataType type, int index) {
   return graph->AddNode(ret_def);
 }
 
-Status ExtractWhileLoopFrames(
+absl::Status ExtractWhileLoopFrames(
     const std::vector<ControlFlowInfo>& cf_info, const Graph* graph,
-    std::unordered_map<string, WhileLoopFrame>* frames,
+    std::unordered_map<std::string, WhileLoopFrame>* frames,
     const NodeFilter& node_filter) {
   for (Node* node : graph->op_nodes()) {
     const ControlFlowInfo& cf = cf_info[node->id()];
@@ -78,11 +78,11 @@ Status ExtractWhileLoopFrames(
     }
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Check that the graph has no cycle containing the given node.
-Status CheckNodeNotInCycle(const Node* node, const int num_nodes) {
+absl::Status CheckNodeNotInCycle(const Node* node, const int num_nodes) {
   std::vector<const Node*> ready;
   ready.push_back(node);
   std::vector<bool> visited(num_nodes);
@@ -92,14 +92,15 @@ Status CheckNodeNotInCycle(const Node* node, const int num_nodes) {
     visited[current_node->id()] = true;
     for (const Edge* out : current_node->out_edges()) {
       if (out->dst() == node) {
-        return errors::Internal("Detected a cycle: ", FormatNodeForError(*node),
-                                " (", node->def().op(), ") feeds into itself.");
+        return absl::InternalError(
+            absl::StrCat("Detected a cycle: ", FormatNodeForError(*node), " (",
+                         node->def().op(), ") feeds into itself."));
       } else if (!visited[out->dst()->id()]) {
         ready.push_back(out->dst());
       }
     }
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace tensorflow

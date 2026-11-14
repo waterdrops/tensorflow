@@ -16,7 +16,9 @@
 
 import numpy as np
 
+from tensorflow.python.eager import backprop
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import gradient_checker
 from tensorflow.python.ops import nn_ops
@@ -24,26 +26,40 @@ import tensorflow.python.ops.nn_grad  # pylint: disable=unused-import
 from tensorflow.python.platform import test
 
 
+def _softsign_grad_grad(activation):
+  return -2 * np.sign(activation) / (1 + np.abs(activation)) ** 3
+
+
 class SoftsignTest(test.TestCase):
 
   def _npSoftsign(self, np_features):
     return np_features / (1 + np.abs(np_features))
 
-  def _testSoftsign(self, np_features, use_gpu=False):
+  def _testSoftsign(self, np_features, atol, rtol, use_gpu=False):
     np_softsign = self._npSoftsign(np_features)
     with self.cached_session(use_gpu=use_gpu):
       softsign = nn_ops.softsign(np_features)
       tf_softsign = self.evaluate(softsign)
-    self.assertAllClose(np_softsign, tf_softsign)
+
+    self.assertAllClose(np_softsign, tf_softsign, rtol=rtol, atol=atol)
     self.assertShapeEqual(np_softsign, softsign)
 
   def testNumbers(self):
-    for t in [np.float64, np.double]:
+    for t, atol, rtol in [
+        (np.float16, 1e-6, 1e-6),
+        (np.float32, 1e-6, 1e-6),
+        (np.float64, 1e-6, 1e-6),
+        (dtypes.bfloat16.as_numpy_dtype, 1e-2, 1e-2),
+    ]:
       self._testSoftsign(
           np.array([[-9, 7, -5, 3, -1], [1, -3, 5, -7, 9]]).astype(t),
+          atol,
+          rtol,
           use_gpu=False)
       self._testSoftsign(
           np.array([[-9, 7, -5, 3, -1], [1, -3, 5, -7, 9]]).astype(t),
+          atol,
+          rtol,
           use_gpu=True)
 
   @test_util.run_deprecated_v1
@@ -70,6 +86,26 @@ class SoftsignTest(test.TestCase):
           TypeError,
           "'features' has DataType int32 not in list of allowed values"):
         nn_ops.softsign(constant_op.constant(7)).eval()
+
+  def testGradGrad(self):
+    with self.cached_session():
+
+      def f(x):
+        with backprop.GradientTape(persistent=True) as tape:
+          tape.watch(x)
+          y = nn_ops.softsign(x)
+          dy = tape.gradient(y, x)
+        return tape.gradient(dy, x)
+
+      for dtype in (np.float32, np.float64):
+        x = np.asarray(
+            [[-0.9, -0.7, -0.5, -0.3, -0.1], [0.1, 0.3, 0.5, 0.7, 0.9]],
+            dtype=dtype,
+            order="F",
+        )
+        got = self.evaluate(f(constant_op.constant(x)))
+        want = _softsign_grad_grad(x.astype(np.float64)).astype(dtype)
+        self.assertAllClose(got, want)
 
 
 if __name__ == "__main__":

@@ -16,11 +16,11 @@
 
 import copy
 import itertools
+import sys
 
 import numpy as np
 
 from google.protobuf import json_format
-
 from tensorflow.core.example import example_pb2
 from tensorflow.core.example import feature_pb2
 from tensorflow.python.eager import context
@@ -30,10 +30,12 @@ from tensorflow.python.framework import errors
 from tensorflow.python.framework import errors_impl
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
+from tensorflow.python.framework import tensor as tensor_lib
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import tensor_util
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import gen_parsing_ops
 from tensorflow.python.ops import parsing_ops
 from tensorflow.python.ops.ragged import ragged_concat_ops
 from tensorflow.python.ops.ragged import ragged_factory_ops
@@ -77,6 +79,27 @@ def _compare_output_to_expected(tester, actual, expected):
 @test_util.run_all_in_graph_and_eager_modes
 class ParseExampleTest(test.TestCase):
 
+  def testRawParseExampleRejectsZeroVariableDenseDimension(self):
+    serialized = [example().SerializeToString()]
+    with self.assertRaisesRegex(
+        (errors.InvalidArgumentError, ValueError),
+        r"dense_shapes\[0\].*greater than 0",
+    ):
+      outputs = gen_parsing_ops.parse_example_v2(
+          serialized=serialized,
+          names=[],
+          sparse_keys=[],
+          dense_keys=["k"],
+          ragged_keys=[],
+          dense_defaults=[constant_op.constant([], dtype=dtypes.float32)],
+          num_sparse=0,
+          sparse_types=[],
+          ragged_value_types=[],
+          ragged_split_types=[],
+          dense_shapes=[[0]],
+      )
+      self.evaluate(outputs)
+
   def _test(self, kwargs, expected_values=None, expected_err=None):
     if expected_err:
       if not context.executing_eagerly():
@@ -96,7 +119,9 @@ class ParseExampleTest(test.TestCase):
     serialized = kwargs["serialized"]
     batch_size = (
         self.evaluate(serialized).size
-        if isinstance(serialized, ops.Tensor) else np.asarray(serialized).size)
+        if isinstance(serialized, tensor_lib.Tensor)
+        else np.asarray(serialized).size
+    )
     for k, f in kwargs["features"].items():
       if isinstance(f, parsing_ops.FixedLenFeature) and f.shape is not None:
         self.assertEqual(tuple(out[k].shape.as_list()), (batch_size,) + f.shape)
@@ -1185,9 +1210,63 @@ class ParseExampleTest(test.TestCase):
         "features": test_features
     }, expected_output)
 
+  def testSerializedContainingMisalignedRaggedFeatureRowLengths(self):
+    original = [
+        example(
+            features=features({
+                "rt_values": float_feature([]),
+                "rt_lengths": int64_feature([5]),
+            })
+        ),
+        example(
+            features=features({
+                "rt_values": float_feature([1.0, 2.0, 3.0, 4.0, 5.0]),
+                "rt_lengths": int64_feature([]),
+            })
+        ),
+    ]
+    serialized = ops.convert_to_tensor(
+        [m.SerializeToString() for m in original]
+    )
+    test_features = {
+        "rt": parsing_ops.RaggedFeature(
+            value_key="rt_values",
+            partitions=[parsing_ops.RaggedFeature.RowLengths("rt_lengths")],
+            dtype=dtypes.float32,
+            validate=True,
+        ),
+    }
+    self._test(
+        {
+            "serialized": serialized,
+            "features": test_features,
+        },
+        expected_err=(
+            (errors_impl.InvalidArgumentError, ValueError),
+            "Feature rt: values and partitions are not aligned",
+        ),
+    )
+
 
 @test_util.run_all_in_graph_and_eager_modes
 class ParseSingleExampleTest(test.TestCase):
+
+  def testRawParseSingleExampleRejectsZeroVariableDenseDimension(self):
+    serialized = example().SerializeToString()
+    with self.assertRaisesRegex(
+        (errors.InvalidArgumentError, ValueError),
+        r"dense_shapes\[0\].*greater than 0",
+    ):
+      outputs = gen_parsing_ops.parse_single_example(
+          serialized=serialized,
+          dense_defaults=[constant_op.constant([], dtype=dtypes.float32)],
+          num_sparse=0,
+          sparse_keys=[],
+          dense_keys=["k"],
+          sparse_types=[],
+          dense_shapes=[[0]],
+      )
+      self.evaluate(outputs)
 
   def _test(self, kwargs, expected_values=None, expected_err=None):
     if expected_err:
@@ -1447,6 +1526,67 @@ class ParseSequenceExampleTest(test.TestCase):
                 ])
         }))
     value.SerializeToString()  # Smoke test
+
+  def testFixedLenSequenceFeatureInvalidShapes(self):
+    with self.assertRaisesRegex(ValueError, "dimensions must be positive"):
+      parsing_ops.FixedLenSequenceFeature(shape=[0], dtype=dtypes.float32)
+    with self.assertRaisesRegex(ValueError, "Dimension -1 must be >= 0"):
+      parsing_ops.FixedLenSequenceFeature(shape=[-1], dtype=dtypes.float32)
+
+  def testRawParseSequenceExampleRejectsZeroFeatureListDimension(self):
+    serialized = [sequence_example().SerializeToString()]
+    with self.assertRaisesRegex(
+        (errors.InvalidArgumentError, ValueError),
+        r"feature_list_dense_shapes\[0\].*greater than 0",
+    ):
+      outputs = gen_parsing_ops.parse_sequence_example_v2(
+          serialized=serialized,
+          debug_name=[],
+          context_sparse_keys=[],
+          context_dense_keys=[],
+          context_ragged_keys=[],
+          feature_list_sparse_keys=[],
+          feature_list_dense_keys=["k"],
+          feature_list_ragged_keys=[],
+          feature_list_dense_missing_assumed_empty=[True],
+          context_dense_defaults=[],
+          Ncontext_sparse=0,
+          context_sparse_types=[],
+          context_ragged_value_types=[],
+          context_ragged_split_types=[],
+          context_dense_shapes=[],
+          Nfeature_list_sparse=0,
+          Nfeature_list_dense=1,
+          feature_list_dense_types=[dtypes.float32],
+          feature_list_sparse_types=[],
+          feature_list_ragged_value_types=[],
+          feature_list_ragged_split_types=[],
+          feature_list_dense_shapes=[[0]],
+      )
+      self.evaluate(outputs)
+
+  def testRawParseSingleSequenceExampleRejectsZeroFeatureListDimension(self):
+    serialized = sequence_example().SerializeToString()
+    with self.assertRaisesRegex(
+        (errors.InvalidArgumentError, ValueError),
+        r"feature_list_dense_shapes\[0\].*greater than 0",
+    ):
+      outputs = gen_parsing_ops.parse_single_sequence_example(
+          serialized=serialized,
+          feature_list_dense_missing_assumed_empty=["k"],
+          context_sparse_keys=[],
+          context_dense_keys=[],
+          feature_list_sparse_keys=[],
+          feature_list_dense_keys=["k"],
+          context_dense_defaults=[],
+          debug_name="",
+          context_sparse_types=[],
+          feature_list_dense_types=[dtypes.float32],
+          context_dense_shapes=[],
+          feature_list_sparse_types=[],
+          feature_list_dense_shapes=[[0]],
+      )
+      self.evaluate(outputs)
 
   def _test(self,
             kwargs,
@@ -2296,6 +2436,17 @@ class ParseSequenceExampleTest(test.TestCase):
             # Message for batch=false in eager mode:
             "|Incompatible shapes|required broadcastable shapes"))
 
+  def testFixedLenSequenceFeatureZeroDimDoesNotCrash(self):
+    # Regression test for https://github.com/tensorflow/tensorflow/issues/123476
+    # ParseSequenceDenseFeatures divided by row_shape.num_elements() without
+    # guarding against the zero case, causing a SIGFPE when shape=[0].
+    # The public Python API now rejects shape=[0] with a recoverable error
+    # rather than crashing the process; verify the error is catchable.
+    with self.assertRaises((ValueError, errors_impl.InvalidArgumentError)):
+      parsing_ops.FixedLenSequenceFeature(
+          shape=[0], dtype=dtypes.float32, allow_missing=True
+      )
+
 
 @test_util.run_all_in_graph_and_eager_modes
 class DecodeRawTest(test.TestCase):
@@ -2308,11 +2459,17 @@ class DecodeRawTest(test.TestCase):
       byte_tensor = parsing_ops.decode_raw_v1(example_tensor, dtypes.uint8)
       return self.evaluate(byte_tensor)
 
-  def _decode_v2(self, words, fixed_length=None):
+  def _decode_v2(
+      self, words, fixed_length=None, dtype=dtypes.uint8, little_endian=True
+  ):
     with self.cached_session():
       examples = np.array(words)
       byte_tensor = parsing_ops.decode_raw(
-          examples, dtypes.uint8, fixed_length=fixed_length)
+          examples,
+          dtype,
+          little_endian=little_endian,
+          fixed_length=fixed_length,
+      )
       return self.evaluate(byte_tensor)
 
   def _ordinalize(self, words, fixed_length=None):
@@ -2363,6 +2520,39 @@ class DecodeRawTest(test.TestCase):
 
     observed = self._decode_v2(words, fixed_length=8)
     expected = self._ordinalize(words, fixed_length=8)
+
+    self.assertAllEqual(expected.shape, observed.shape)
+    self.assertAllEqual(expected, observed)
+
+  def testDecodeRawInvalidFixedLengthSize(self):
+    input_bytes = ["1"]
+    # Different error messages depending on shape inference vs kernel.
+    with self.assertRaisesRegex(
+        (ValueError, errors_impl.InvalidArgumentError),
+        "must be a multiple of|evenly divisible by",
+    ):
+      self.evaluate(
+          self._decode_v2(input_bytes, fixed_length=7, dtype=dtypes.float32)
+      )
+
+  def testDecodeRawExtendedInputBytesLittleEndian(self):
+    # Input bytes properly padded internally to at least dtype size.
+    input_bytes = ["\x01\x23"]
+    observed = self._decode_v2(
+        input_bytes, fixed_length=8, dtype=dtypes.int32, little_endian=True
+    )
+    expected = np.array([[0x00002301, 0]], dtype=np.int32)
+
+    self.assertAllEqual(expected.shape, observed.shape)
+    self.assertAllEqual(expected, observed)
+
+  def testDecodeRawExtendedInputBytesBigEndian(self):
+    # Input bytes properly padded internally to at least dtype size.
+    input_bytes = [b"\x01\x23"]
+    observed = self._decode_v2(
+        input_bytes, fixed_length=8, dtype=dtypes.int32, little_endian=False
+    )
+    expected = np.array([[0x01230000, 0]], dtype=np.int32)
 
     self.assertAllEqual(expected.shape, observed.shape)
     self.assertAllEqual(expected, observed)
@@ -2462,7 +2652,10 @@ class ParseTensorOpTest(test.TestCase):
   def testToFloat32(self):
     with self.cached_session():
       expected = np.random.rand(3, 4, 5).astype(np.float32)
-      tensor_proto = tensor_util.make_tensor_proto(expected)
+      if sys.byteorder == "big":
+        tensor_proto = tensor_util.make_tensor_proto(expected.byteswap())
+      else:
+        tensor_proto = tensor_util.make_tensor_proto(expected)
 
       serialized = array_ops.placeholder(dtypes.string)
       tensor = parsing_ops.parse_tensor(serialized, dtypes.float32)
@@ -2507,12 +2700,43 @@ class ParseTensorOpTest(test.TestCase):
       tensor = parsing_ops.parse_tensor(serialized, dtypes.uint16)
 
       with self.assertRaisesOpError(
-          "Could not parse `serialized` as TensorProto: 'bogus'"):
+          "Could not parse `serialized` as TensorProto, base64: Ym9ndXM="):
         tensor.eval(feed_dict={serialized: "bogus"})
 
       with self.assertRaisesOpError(
           r"Expected `serialized` to be a scalar, got shape: \[1\]"):
         tensor.eval(feed_dict={serialized: ["bogus"]})
+
+
+class ParseTensorVariantRegressionTest(test_util.TensorFlowTestCase):
+
+  def testMalformedVariantTensorListDoesNotCrash(self):
+    """Regression test: malformed TensorList Variant must raise clean error.
+
+    A TensorProto with dtype=DT_VARIANT wrapping a tensorflow::TensorList
+    with empty metadata previously caused a SIGSEGV in PyErr_Occurred() via
+    pybind11 exception translation instead of raising InvalidArgumentError.
+    Confirmed in TF 2.21.0 in fresh isolated containers.
+
+    Root cause: FromProtoField<Variant> in tensor.cc called buf->Unref()
+    with data[0..i] holding partially-decoded Variant objects after
+    DecodeUnaryVariant returned false, corrupting Python thread state.
+    """
+    from tensorflow.core.framework import tensor_pb2
+
+    outer = tensor_pb2.TensorProto()
+    outer.dtype = dtypes.variant.as_datatype_enum
+    outer.tensor_shape.dim.add().size = 1
+    v = outer.variant_val.add()
+    v.type_name = "tensorflow::TensorList"
+    leaf = v.tensors.add()
+    leaf.dtype = dtypes.float32.as_datatype_enum
+    leaf.tensor_shape.dim.add().size = 1
+    serialized = outer.SerializeToString()
+    with self.assertRaises(errors.InvalidArgumentError):
+      self.evaluate(
+          parsing_ops.parse_tensor(serialized, out_type=dtypes.variant)
+      )
 
 
 if __name__ == "__main__":

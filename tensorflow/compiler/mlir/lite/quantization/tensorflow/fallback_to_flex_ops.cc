@@ -12,157 +12,164 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <memory>
+#include <set>
 #include <string>
+#include <utility>
 
+#include "absl/base/attributes.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "flatbuffers/flexbuffers.h"  // from @flatbuffers
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
+#include "mlir/IR/Attributes.h"  // from @llvm-project
+#include "mlir/IR/Builders.h"  // from @llvm-project
+#include "mlir/IR/BuiltinAttributes.h"  // from @llvm-project
+#include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
+#include "mlir/IR/Diagnostics.h"  // from @llvm-project
+#include "mlir/IR/DialectRegistry.h"  // from @llvm-project
+#include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/Operation.h"  // from @llvm-project
+#include "mlir/IR/PatternMatch.h"  // from @llvm-project
+#include "mlir/IR/Value.h"  // from @llvm-project
 #include "mlir/Pass/Pass.h"  // from @llvm-project
+#include "mlir/Pass/PassRegistry.h"  // from @llvm-project
+#include "mlir/Support/LLVM.h"  // from @llvm-project
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_dialect.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
-#include "tensorflow/compiler/mlir/tensorflow/translate/export_tf_dialect_op.h"
+#include "tensorflow/compiler/mlir/tensorflow/utils/translate_utils.h"
+#include "tensorflow/core/framework/node_def.pb.h"
 
 namespace mlir {
 namespace TF {
-namespace {
+namespace internal {
 
 // The name prefix of Flex ops.
-constexpr char kFlexOpNamePrefix[] = "Flex";
+constexpr absl::string_view kFlexOpNamePrefix = "Flex";
+// Don't fallback to Flex op if this attribute is set. This attribute is
+// transient and is only used inside this pass. First, the pass looks for
+// predefined patterns and set this attribute to ops in the patterns. Then,
+// when parsing the function, if find ops with this attribute, the pass
+// remove the attribute and skip further processing on those ops.
+constexpr char kNoFallbackAttr[] = "no_fallback";
+// TF Quantization modes. These constants are defined as char arrays so they
+// can parsed by the pass option.
 constexpr char kDefaultMode[] = "DEFAULT";
 constexpr char kLegacyIntegerMode[] = "LEGACY_INTEGER";
 
-// Checks if the operation is allowlisted in the Legacy Integer mode.
-bool IsAllowListedOpInLegacyMode(Operation *op) {
-  if (llvm::isa<
-          // clang-format off
-          // go/keep-sorted start
-          TF::AbsOp,
-          TF::AddOp,
-          TF::AddV2Op,
-          TF::ArgMaxOp,
-          TF::AvgPoolOp,
-          TF::BiasAddOp,
-          TF::BucketizeOp,
-          TF::ConcatV2Op,
-          TF::ConstOp,
-          TF::Conv2DBackpropInputOp,
-          TF::Conv2DOp,
-          TF::DepthwiseConv2dNativeOp,
-          TF::GatherV2Op,
-          TF::IdentityOp,
-          TF::MatMulOp,
-          TF::MaxPoolOp,
-          TF::MaximumOp,
-          TF::MeanOp,
-          TF::MinimumOp,
-          TF::MulOp,
-          TF::PadOp,
-          TF::PadV2Op,
-          TF::PartitionedCallOp,
-          TF::Relu6Op,
-          TF::ReluOp,
-          TF::ReshapeOp,
-          TF::SoftmaxOp,
-          TF::StatefulPartitionedCallOp,
-          TF::SubOp,
-          TF::TransposeOp
-          // go/keep-sorted end
-          // clang-format on
-          >(op)) {
-    return true;
-  }
-  return false;
+// Checks if the operation is TF FakeQuant ops.
+bool IsTfFakeQuantOp(Operation *op) {
+  return llvm::isa<
+      // clang-format off
+      TF::FakeQuantWithMinMaxArgsOp,
+      TF::FakeQuantWithMinMaxVarsOp,
+      TF::FakeQuantWithMinMaxVarsPerChannelOp
+      // clang-format on
+      >(op);
 }
 
-// Checks if the operation is allowlisted in the Default mode.
-bool IsAllowListedOpInDefaultMode(Operation *op) {
-  if (llvm::isa<
+// Checks if the operation is allowlisted in both modes. These ops are not
+// quantizable but is necessary to make the conversion successful.
+bool IsAlwaysAllowlistedOp(Operation *op) {
+  return llvm::isa<
+      // clang-format off
+      // go/keep-sorted start
+      TF::ConstOp,
+      TF::IdentityOp,
+      TF::PartitionedCallOp,
+      TF::StatefulPartitionedCallOp
+      // go/keep-sorted end
+      // clang-format on
+      >(op);
+}
+
+// LINT.IfChange
+// The list of quantizable ops in the Legacy Integer mode.
+ABSL_ATTRIBUTE_NOINLINE const std::set<std::string>
+    &QuantizableOpsInLegacyMode() {
+  static const std::set<std::string> *legacy_op_list =
+      new std::set<std::string>({
           // clang-format off
           // go/keep-sorted start
-          TF::BiasAddOp,
-          TF::ConstOp,
-          TF::Conv2DBackpropInputOp,
-          TF::Conv2DOp,
-          TF::DepthwiseConv2dNativeOp,
-          TF::IdentityOp,
-          TF::MatMulOp,
-          TF::PartitionedCallOp,
-          TF::Relu6Op,
-          TF::ReluOp,
-          TF::StatefulPartitionedCallOp
+          TF::AbsOp::getOperationName().str(),
+          TF::AddOp::getOperationName().str(),
+          TF::AddV2Op::getOperationName().str(),
+          TF::ArgMaxOp::getOperationName().str(),
+          TF::AvgPoolOp::getOperationName().str(),
+          TF::BiasAddOp::getOperationName().str(),
+          TF::BucketizeOp::getOperationName().str(),
+          TF::ConcatV2Op::getOperationName().str(),
+          TF::Conv2DBackpropInputOp::getOperationName().str(),
+          TF::Conv2DOp::getOperationName().str(),
+          TF::DepthwiseConv2dNativeOp::getOperationName().str(),
+          TF::FusedBatchNormV3Op::getOperationName().str(),
+          TF::GatherV2Op::getOperationName().str(),
+          TF::MatMulOp::getOperationName().str(),
+          TF::MaxPoolOp::getOperationName().str(),
+          TF::MaximumOp::getOperationName().str(),
+          TF::MeanOp::getOperationName().str(),
+          TF::MinimumOp::getOperationName().str(),
+          TF::MulOp::getOperationName().str(),
+          TF::PadOp::getOperationName().str(),
+          TF::PadV2Op::getOperationName().str(),
+          TF::Relu6Op::getOperationName().str(),
+          TF::ReluOp::getOperationName().str(),
+          TF::ReshapeOp::getOperationName().str(),
+          TF::SoftmaxOp::getOperationName().str(),
+          TF::SubOp::getOperationName().str(),
+          TF::TransposeOp::getOperationName().str(),
           // go/keep-sorted end
           // clang-format on
-          >(op)) {
-    return true;
-  }
-  return false;
+      });
+  return *legacy_op_list;
 }
+
+// The list of quantizable ops in the Default mode.
+ABSL_ATTRIBUTE_NOINLINE const std::set<std::string>
+    &QuantizableOpsInDefaultMode() {
+  static const std::set<std::string> *default_op_list =
+      new std::set<std::string>({
+          // clang-format off
+          // go/keep-sorted start
+          TF::BiasAddOp::getOperationName().str(),
+          TF::Conv2DBackpropInputOp::getOperationName().str(),
+          TF::Conv2DOp::getOperationName().str(),
+          TF::DepthwiseConv2dNativeOp::getOperationName().str(),
+          TF::FusedBatchNormV3Op::getOperationName().str(),
+          TF::MatMulOp::getOperationName().str(),
+          TF::Relu6Op::getOperationName().str(),
+          TF::ReluOp::getOperationName().str(),
+          // go/keep-sorted end
+          // clang-format on
+      });
+  return *default_op_list;
+}
+// LINT.ThenChange(Google-internal path)
 
 // Checks if the operation can be fused with bias.
 inline bool IsFusibleWithBiasOp(Operation *op) {
-  if (llvm::isa<
-          // clang-format off
-          TF::MatMulOp,
-          TF::Conv2DOp,
-          TF::DepthwiseConv2dNativeOp,
-          TF::Conv2DBackpropInputOp,
-          TF::Conv3DOp,
-          TF::Conv3DBackpropInputV2Op
-          // clang-format on
-          >(op)) {
-    return true;
-  }
-  return false;
+  return llvm::isa<
+      // clang-format off
+      TF::MatMulOp,
+      TF::Conv2DOp,
+      TF::DepthwiseConv2dNativeOp,
+      TF::Conv2DBackpropInputOp,
+      TF::Conv3DOp,
+      TF::Conv3DBackpropInputV2Op
+      // clang-format on
+      >(op);
 }
-
-// If the Add op can be fused as bias, converts it to BiasAdd op.
-class ConvertAddToBiasAddPattern : public OpRewritePattern<TF::AddV2Op> {
- public:
-  using OpRewritePattern<TF::AddV2Op>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(TF::AddV2Op add_op,
-                                PatternRewriter &rewriter) const override {
-    // Fusable AddOp must have 1D constant value in the rhs since the BiasAddOp
-    // can only accept 1D bias value and only constant value can be fused.
-    DenseElementsAttr added_value;
-    if (!matchPattern(add_op.y(), m_Constant(&added_value))) return failure();
-    if (!IsFusibleWithBiasOp(add_op.x().getDefiningOp())) return failure();
-    auto y_type = add_op.y().getType().template dyn_cast<RankedTensorType>();
-    if (!y_type || y_type.getRank() != 1) return failure();
-
-    rewriter.replaceOpWithNewOp<TF::BiasAddOp>(add_op, add_op.getType(),
-                                               add_op.x(), add_op.y());
-    return success();
-  }
-};
-
-// If the Sub op can be fused as bias, converts it to BiasAdd op.
-class ConvertSubToBiasAddPattern : public OpRewritePattern<TF::SubOp> {
- public:
-  using OpRewritePattern<TF::SubOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(TF::SubOp sub_op,
-                                PatternRewriter &rewriter) const override {
-    // Fusable AddOp must have 1D constant value in the rhs since the BiasAddOp
-    // can only accept 1D bias value and only constant value can be fused.
-    DenseElementsAttr sub_value;
-    if (!matchPattern(sub_op.y(), m_Constant(&sub_value))) return failure();
-    if (!IsFusibleWithBiasOp(sub_op.x().getDefiningOp())) return failure();
-    auto y_type = sub_op.y().getType().template dyn_cast<RankedTensorType>();
-    if (!y_type || y_type.getRank() != 1) return failure();
-
-    auto add_value = rewriter.create<TF::NegOp>(sub_op.getLoc(), sub_op.y());
-    rewriter.replaceOpWithNewOp<TF::BiasAddOp>(sub_op, sub_op.getType(),
-                                               sub_op.x(), add_value);
-    return success();
-  }
-};
 
 // Creates the custom option of the Flex ops.
 inline void CreateFlexOpCustomOptions(const std::string &op_name,
                                       const std::string &node_def_str,
                                       std::string &custom_option_buffer) {
-  auto flex_builder = absl::make_unique<flexbuffers::Builder>();
+  auto flex_builder = std::make_unique<flexbuffers::Builder>();
   flex_builder->Vector([&]() {
     flex_builder->String(op_name);
     flex_builder->String(node_def_str);
@@ -173,23 +180,21 @@ inline void CreateFlexOpCustomOptions(const std::string &op_name,
 }
 
 // Creates ElementsAttr for custom option.
-inline OpaqueElementsAttr CustomOptionForFlexOp(OpBuilder *builder,
-                                                const std::string &content) {
-  ShapedType type = RankedTensorType::get(
-      {static_cast<int64_t>(content.size())}, builder->getIntegerType(8));
-  return OpaqueElementsAttr::get(builder->getContext()->getLoadedDialect("tfl"),
-                                 type,
-                                 StringRef(content.data(), content.size()));
+inline TFL::ConstBytesAttr CustomOptionForFlexOp(OpBuilder *builder,
+                                                 const std::string &content) {
+  return TFL::ConstBytesAttr::get(builder->getContext(),
+                                  StringRef(content.data(), content.size()));
 }
 
 // Fallbacks ops that are not supported by TF Quantization to TFLite Flex ops.
-class FallbackToFlexOps : public PassWrapper<FallbackToFlexOps, FunctionPass> {
+class FallbackToFlexOps
+    : public PassWrapper<FallbackToFlexOps, OperationPass<func::FuncOp>> {
  public:
-  FallbackToFlexOps() {}
+  FallbackToFlexOps() = default;
   explicit FallbackToFlexOps(const std::string &mode) { mode_ = mode; }
   FallbackToFlexOps(const FallbackToFlexOps &other) { mode_ = other.mode_; }
 
-  void runOnFunction() override;
+  void runOnOperation() override;
 
   StringRef getArgument() const final { return "quant-raise-flex-fallback"; }
 
@@ -209,12 +214,15 @@ class FallbackToFlexOps : public PassWrapper<FallbackToFlexOps, FunctionPass> {
 
   // Checks if the operation is allowlisted in the current mode.
   bool IsAllowListedOp(Operation *op) {
-    if (mode_ == kDefaultMode) {
-      return IsAllowListedOpInDefaultMode(op);
+    std::string op_name = op->getName().getStringRef().str();
+    if (IsAlwaysAllowlistedOp(op) || IsTfFakeQuantOp(op)) {
+      return true;
+    } else if (mode_ == kDefaultMode) {
+      return QuantizableOpsInDefaultMode().count(op_name) > 0;
     } else if (mode_ == kLegacyIntegerMode) {
-      return IsAllowListedOpInLegacyMode(op);
+      return QuantizableOpsInLegacyMode().count(op_name) > 0;
     } else {
-      mlir::emitError(getFunction().getLoc(), "Unregconized mode: " + mode_);
+      mlir::emitError(getOperation().getLoc(), "Unregconized mode: " + mode_);
       signalPassFailure();
       return true;
     }
@@ -225,7 +233,7 @@ class FallbackToFlexOps : public PassWrapper<FallbackToFlexOps, FunctionPass> {
 };
 
 bool FallbackToFlexOps::ConvertToFlexOp(Operation *op) {
-  tensorflow::StatusOr<std::unique_ptr<tensorflow::NodeDef>> node_def =
+  absl::StatusOr<std::unique_ptr<tensorflow::NodeDef>> node_def =
       tensorflow::ConvertTFDialectOpToNodeDef(
           op, /*name=*/"", /*ignore_unregistered_attrs=*/true);
   if (!node_def.ok()) {
@@ -244,42 +252,73 @@ bool FallbackToFlexOps::ConvertToFlexOp(Operation *op) {
   std::string flex_op_name = std::string(kFlexOpNamePrefix) + op_name;
   std::string custom_option_buffer;
   CreateFlexOpCustomOptions(op_name, node_def_str, custom_option_buffer);
-  auto flex_op = builder.create<TFL::CustomOp>(
-      op->getLoc(), op->getResultTypes(), op->getOperands(), flex_op_name,
-      CustomOptionForFlexOp(&builder, custom_option_buffer));
+  auto flex_op = TFL::CustomOp::create(
+      builder, op->getLoc(), op->getResultTypes(), op->getOperands(),
+      flex_op_name, CustomOptionForFlexOp(&builder, custom_option_buffer));
   op->replaceAllUsesWith(flex_op);
   op->erase();
   return true;
 }
 
-void FallbackToFlexOps::runOnFunction() {
+// Sets the "no_fallback" attribute.
+Value SetNoFallbackAttr(PatternRewriter &rewriter, Value val) {
+  val.getDefiningOp()->setAttr(kNoFallbackAttr, rewriter.getUnitAttr());
+  return val;
+}
+
+// Returns true if the attr is a float attribute and be equal to value.
+static bool FloatValueEquals(const Attribute &attr, double value) {
+  auto fp_attr = mlir::dyn_cast_or_null<DenseFPElementsAttr>(attr);
+  if (fp_attr == nullptr) return false;
+
+  if (fp_attr.isSplat()) {
+    return fp_attr.getSplatValue<APFloat>().isExactlyValue(value);
+  }
+  return llvm::all_of(fp_attr.getValues<APFloat>(), [value](const APFloat &f) {
+    return f.isExactlyValue(value);
+  });
+}
+
+// Returns true if the rank of the value equals to the given rank.
+bool RankEquals(Value value, int rank) {
+  auto rank_type = mlir::dyn_cast<RankedTensorType>(value.getType());
+  return (rank_type && rank_type.getRank() == rank);
+}
+
+#include "tensorflow/compiler/mlir/lite/quantization/tensorflow/fallback_to_flex_patterns.inc"
+
+void FallbackToFlexOps::runOnOperation() {
   if (mode_.empty()) return;
 
-  FuncOp func = getFunction();
+  func::FuncOp func = getOperation();
   MLIRContext *ctx = &getContext();
 
   // Convert binary ops to BiasAdd ops if possible.
-  OwningRewritePatternList patterns(ctx);
-  patterns.insert<ConvertAddToBiasAddPattern, ConvertSubToBiasAddPattern>(ctx);
-  (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+  RewritePatternSet patterns(ctx);
+  populateWithGenerated(patterns);
+  (void)applyPatternsGreedily(func, std::move(patterns));
 
   // Convert unsupported ops to Flex ops.
   auto tf_dialect = ctx->getLoadedDialect<TF::TensorFlowDialect>();
   func.walk([&](Operation *op) {
     if (op->getDialect() != tf_dialect) return;
     if (IsAllowListedOp(op)) return;
+    if (op->hasAttr(kNoFallbackAttr)) {
+      op->removeAttr(kNoFallbackAttr);
+      return;
+    }
     if (!ConvertToFlexOp(op)) signalPassFailure();
   });
 }
-}  // namespace
+}  // namespace internal
 
-std::unique_ptr<OperationPass<FuncOp>> CreateFallbackToFlexOpsPass(
+std::unique_ptr<OperationPass<func::FuncOp>> CreateFallbackToFlexOpsPass(
     const std::string &mode) {
-  return std::make_unique<FallbackToFlexOps>(mode);
+  return std::make_unique<internal::FallbackToFlexOps>(mode);
 }
 
-static PassRegistration<FallbackToFlexOps> pass([] {
-  return CreateFallbackToFlexOpsPass(/*mode=*/kDefaultMode);
+static PassRegistration<internal::FallbackToFlexOps> pass([] {
+  return CreateFallbackToFlexOpsPass(/*mode=*/internal::kDefaultMode);
 });
 
 }  // namespace TF

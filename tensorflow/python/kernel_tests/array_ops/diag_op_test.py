@@ -17,9 +17,13 @@ import itertools
 
 import numpy as np
 
+from tensorflow.core.protobuf import config_pb2
+from tensorflow.python.eager import def_function
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes as dtypes_lib
+from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gradient_checker
@@ -429,6 +433,7 @@ class MatrixDiagTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testVectorBatch(self):
+    self._testVectorBatch(dtypes_lib.bfloat16.as_numpy_dtype)
     self._testVectorBatch(np.float32)
     self._testVectorBatch(np.float64)
     self._testVectorBatch(np.int32)
@@ -535,6 +540,10 @@ class MatrixDiagTest(test.TestCase):
   def testInvalidShape(self):
     with self.assertRaisesRegex(ValueError, "must be at least rank 1"):
       array_ops.matrix_diag(0)
+    with self.assertRaisesRegex(ValueError, "must have at least rank 2"):
+      array_ops.matrix_diag([1, 2], k=[1, 2])
+    with self.assertRaisesRegex(ValueError, "must have at least rank 2"):
+      array_ops.matrix_diag([1, 2], k=(-1, 1))
 
   @test_util.run_deprecated_v1
   def testInvalidShapeAtEval(self):
@@ -656,6 +665,7 @@ class MatrixSetDiagTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testSquareBatch(self):
+    self._testSquareBatch(dtypes_lib.bfloat16.as_numpy_dtype)
     self._testSquareBatch(np.float32)
     self._testSquareBatch(np.float64)
     self._testSquareBatch(np.int32)
@@ -687,6 +697,38 @@ class MatrixSetDiagTest(test.TestCase):
                 input_mat, vecs, k=diags, align=align)
             self.assertEqual(output.get_shape(), solution.shape)
             self.assertAllEqual(output, solution)
+
+  def testBandWithUnknownDimensions(self):
+    # Shape inference first runs before it has k's value, and with the input's
+    # dimensions not all known, it took a band's diagonals for a single
+    # diagonal's and failed with "Shapes must be equal rank".
+    x = np.arange(1, 17, dtype=np.int32).reshape(4, 4)
+    diagonals = np.array([[90, 91, 92, 93], [80, 81, 82, 83]], dtype=np.int32)
+    for input_shape, diag_shape, x, diagonals in (
+        ([None, 4], [2, None], x, diagonals),
+        (
+            [None, None, 4],
+            [None, 2, None],
+            np.stack([x, -x]),
+            np.stack([diagonals, -diagonals]),
+        ),
+    ):
+      set_band = def_function.function(
+          lambda x, diagonals: array_ops.matrix_set_diag(
+              x, diagonals, k=(-1, 0)
+          ),
+          input_signature=[
+              tensor_spec.TensorSpec(input_shape, dtypes_lib.int32),
+              tensor_spec.TensorSpec(diag_shape, dtypes_lib.int32),
+          ],
+      )
+      self.assertEqual(
+          set_band.get_concrete_function().output_shapes.as_list(), input_shape
+      )
+      self.assertAllEqual(
+          set_band(x, diagonals),
+          array_ops.matrix_set_diag(x, diagonals, k=(-1, 0)),
+      )
 
   @test_util.run_deprecated_v1
   def testInvalidShape(self):
@@ -765,6 +807,30 @@ class MatrixSetDiagTest(test.TestCase):
       self.assertAllEqual(grad_input_val - np.diag(np.diag(grad_input_val)),
                           grad_vals[0])
 
+  @test_util.run_deprecated_v1
+  def testInvalidDiagRankAtEval(self):
+    config = config_pb2.ConfigProto()
+    config.graph_options.optimizer_options.global_jit_level = (
+        config_pb2.OptimizerOptions.OFF
+    )
+    with self.session(config=config, use_gpu=False):
+      with ops.device("/cpu:0"):
+        v = array_ops.placeholder(dtype=dtypes_lib.float32)
+        d = array_ops.placeholder(dtype=dtypes_lib.float32)
+        # Input rank 3
+        input_shape = (2, 3, 4)
+        # Diag rank 1. Triggers check because rank <= 3-2=1.
+        diag_shape = (10,)
+        k = (-1, 1)
+
+        with self.assertRaisesOpError(
+            "Diagonal tensor rank must be large enough to contain a "
+            "diagonal-count dimension"
+        ):
+          array_ops.matrix_set_diag(v, d, k=k).eval(
+              feed_dict={v: np.zeros(input_shape), d: np.zeros(diag_shape)}
+          )
+
 
 class MatrixDiagPartTest(test.TestCase):
 
@@ -841,6 +907,7 @@ class MatrixDiagPartTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testSquareBatch(self):
+    self._testSquareBatch(dtypes_lib.bfloat16.as_numpy_dtype)
     self._testSquareBatch(np.float32)
     self._testSquareBatch(np.float64)
     self._testSquareBatch(np.int32)
@@ -1065,6 +1132,13 @@ class DiagTest(test.TestCase):
     with self.assertRaisesRegex(ValueError, "must be at least rank 1"):
       array_ops.diag(0.0)
 
+  def testInvalidInput(self):
+    with self.session():
+      with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+        op = array_ops.matrix_diag(
+            k=1070828000000, diagonal=np.ones((2, 2, 2, 2)))
+        self.evaluate(op)
+
 
 class DiagPartOpTest(test.TestCase):
 
@@ -1187,6 +1261,25 @@ class DiagGradPartOpTest(test.TestCase):
               y.get_shape().as_list())
           tf_logging.info("error = %f", error)
           self.assertLess(error, 1e-4)
+
+  def testMatrixDiagV3InvalidAndOverflowDimensions(self):
+    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+      array_ops.matrix_diag_v3(
+          diagonal=[1.0, 2.0],
+          k=0,
+          num_rows=-5,
+          num_cols=2,
+          padding_value=0.0,
+      )
+
+    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+      array_ops.matrix_diag_v3(
+          diagonal=[1.0, 2.0],
+          k=0,
+          num_rows=2**62,
+          num_cols=2**62,
+          padding_value=0.0,
+      )
 
 
 if __name__ == "__main__":
